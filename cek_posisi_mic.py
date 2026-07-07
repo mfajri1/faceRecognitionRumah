@@ -1,53 +1,50 @@
 import pyaudio
-import wave
+import numpy as np
 
-# LIHAT ID MIC DARI HASIL SEBELUMNYA:
-# ID 1 = Rexus SW-10 Webcam
-# ID 2 = USB Composite Device
-ID_MIC_YANG_DITES = 1  # <-- Ganti angka ini (1 atau 2) untuk menguji masing-masing mic
+# Coba ganti angka ini antara 1 atau 2 sesuai ID mic Anda sebelumnya
+ID_MIC = 1  
 
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 48000
 CHUNK = 1024
-RECORD_SECONDS = 5
-WAVE_OUTPUT_FILENAME = f"tes_suara_mic_ID_{ID_MIC_YANG_DITES}.wav"
 
 p = pyaudio.PyAudio()
 
-print(f"=== MENCOBA REKAM LEWAT MIC ID: {ID_MIC_YANG_DITES} ===")
+print(f"=== MEMULAI TES VISUAL MIC ID: {ID_MIC} ===")
+print("Dekatkan mulut ke mic dan bicaralah. Lihat apakah grafik batangan (||||) bergerak naik-turun.")
+print("Tekan Ctrl+C untuk berhenti.\n")
+
 try:
     stream = p.open(format=FORMAT,
                     channels=CHANNELS,
                     rate=RATE,
                     input=True,
-                    input_device_index=ID_MIC_YANG_DITES, # Mengunci ID Mic
+                    input_device_index=ID_MIC,
                     frames_per_buffer=CHUNK)
 except Exception as e:
-    print(f"? Error: Tidak bisa membuka Mic ID {ID_MIC_YANG_DITES}. Pesan: {e}")
+    print(f"❌ Gagal membuka Mic ID {ID_MIC}: {e}")
     p.terminate()
     exit()
 
-print("?? MULAI REKAM... Silahkan bicara dekat mic: 'Tes Satu Dua Tiga'...")
-frames = []
-
-for i in range(0, int(RATE / CHUNK * RECORD_SECONDS)):
-    data = stream.read(CHUNK, exception_on_overflow=False)
-    frames.append(data)
-
-print("?? SELESAI MEREKAM.")
+try:
+    while True:
+        # Baca data biner dari mic
+        data = stream.read(CHUNK, exception_on_overflow=False)
+        # Ubah data biner menjadi array angka tingkat kekencangan suara
+        audio_data = np.frombuffer(data, dtype=np.int16)
+        # Hitung rata-rata amplitudo (volume)
+        volume = np.abs(audio_data).mean()
+        
+        # Buat grafik batangan sederhana berdasarkan intensitas volume
+        bar_length = int(volume / 100)
+        bar = "█" * min(bar_length, 50)  # Batasi panjang grafik maksimal 50 karakter
+        
+        # Cetak grafik real-time di baris yang sama
+        print(f"Volume Mic: {int(volume):<5} {bar:<50}", end="\r")
+except KeyboardInterrupt:
+    print("\n⏹️ Pengujian dihentikan.")
 
 stream.stop_stream()
 stream.close()
 p.terminate()
-
-# Simpan hasil rekaman menjadi file audio .wav
-wf = wave.open(WAVE_OUTPUT_FILENAME, 'wb')
-wf.setnchannels(CHANNELS)
-wf.setsampwidth(p.get_sample_size(FORMAT))
-wf.setframerate(RATE)
-wf.writeframes(b''.join(frames))
-wf.close()
-
-print(f"? File suara berhasil disimpan dengan nama: {WAVE_OUTPUT_FILENAME}")
-print("Silahkan buka File Manager Raspi Anda, lalu putar file tersebut menggunakan headset/speaker untuk mendengar hasilnya!")
