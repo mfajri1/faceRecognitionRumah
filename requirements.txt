@@ -1,0 +1,6 @@
+opencv-contrib-python
+SpeechRecognition
+PyAudio
+numpy
+Pillow
+requests

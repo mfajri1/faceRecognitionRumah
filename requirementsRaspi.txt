@@ -1,0 +1,12 @@
+opencv-contrib-python
+SpeechRecognition
+PyAudio
+numpy
+Pillow
+requests
+
+# Khusus untuk Raspberry Pi (kontrol relay solenoid & vibrasi via GPIO):
+# RPi.GPIO biasanya sudah pre-installed di Raspberry Pi OS.
+# Kalau belum ada, install salah satu cara ini di Raspberry Pi:
+#   sudo apt install python3-rpi.gpio
+#   atau: pip install RPi.GPIO
