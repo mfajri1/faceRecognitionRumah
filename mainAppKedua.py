@@ -1,6 +1,6 @@
 """
-SISTEM KEAMANAN PINTU: WAJAH + SUARA (EDISI KHUSUS RASPBERRY PI 3 - REVISI LOGIKA BUZZER & RELAY)
-==========================================================================================
+SISTEM KEAMANAN PINTU: WAJAH + SUARA (EDISI LCD 20X4 I2C RASPBERRY PI)
+===================================================================
 """
 
 import os
@@ -33,6 +33,19 @@ except ImportError:
     GPIO_AVAILABLE = False
     print("[GPIO] Berjalan dalam mode simulasi PC (Pustaka GPIO tidak terdeteksi).")
 
+# --- INTEGRASI LCD 20x4 I2C ---
+try:
+    from smbus2 import SMBus
+    from RPLCD.i2c import CharLCD
+    # Menginisialisasi LCD 20x4 dengan alamat i2c standar (biasanya 0x27 atau 0x3f)
+    lcd = CharLCD('PCF8574', 0x27, port=1, cols=20, rows=4)
+    LCD_AVAILABLE = True
+    print("[LCD] LCD 20x4 I2C Terdeteksi dan Aktif.")
+except Exception as e:
+    LCD_AVAILABLE = False
+    lcd = None
+    print(f"[LCD WARNING] Gagal memuat LCD (Mode simulasi): {e}")
+
 # ============================================================
 # KONFIGURASI SISTEM & PIN HARDWARE
 # ============================================================
@@ -43,7 +56,6 @@ MIN_SAMPLES = 3
 FACE_SIZE = (200, 200) 
 LBPH_THRESHOLD = 70 
 
-# OPTIMASI: Resolusi diperkecil ke 480x270 agar FPS di Raspberry Pi 3 mulus
 VIDEO_DISPLAY_SIZE = (480, 270) 
 
 COLOR_BG = "#1e1e2f"
@@ -60,23 +72,38 @@ WA_TARGET = "628136554516"
 # --- Alokasi PIN GPIO ---
 RELAY_SOLENOID_PIN = 17       # Relay 1 (Solenoid Pintu) - Active Low
 RELAY_DISCHARGE_PIN = 27      # Relay 2 (Electric Discharge)
-
-# PIN UTAMA PERANGKAT
-BUZZER_PIN = 22               # Buzzer sekarang terhubung ke PIN 22 sesuai permintaan
+BUZZER_PIN = 22               # Buzzer terhubung ke PIN 22
 LED_SCANNING_PIN = 23         
 LED_TERDETEKSI_PIN = 24       
 LED_SALAH_PIN = 25            
 
 DURASI_SOLENOID_DETIK = 4
-DURASI_DISCHARGE_DETIK = 5    # Diubah menjadi 5 detik sesuai permintaan
+DURASI_DISCHARGE_DETIK = 5    
 
-# Tipe modul relay/hardware
 RELAY_ACTIVE_LOW = True
 BUZZER_ACTIVE_LOW = False
 
 # ============================================================
-# INISIALISASI KONTROL PERANGKAT KERAS
+# FUNGSI HARDWARE & LCD UTILITY
 # ============================================================
+
+def lcd_cetak(baris1="", baris2="", baris3="", baris4=""):
+    """Fungsi pembantu untuk mencetak teks ke LCD 20x4 dengan rapi"""
+    if not LCD_AVAILABLE or lcd is None:
+        return
+    try:
+        lcd.clear()
+        # Mengisi baris demi baris dan memotong teks jika lebih dari 20 karakter agar tidak bug
+        lcd.cursor_pos = (0, 0)
+        lcd.write_string(baris1[:20].center(20))
+        lcd.cursor_pos = (1, 0)
+        lcd.write_string(baris2[:20].center(20))
+        lcd.cursor_pos = (2, 0)
+        lcd.write_string(baris3[:20].center(20))
+        lcd.cursor_pos = (3, 0)
+        lcd.write_string(baris4[:20].center(20))
+    except Exception as e:
+        print(f"[LCD ERROR] Gagal menulis ke layar: {e}")
 
 if GPIO_AVAILABLE:
     GPIO.setmode(GPIO.BCM)
@@ -103,7 +130,6 @@ def set_buzzer(aktif):
         GPIO.output(BUZZER_PIN, GPIO.HIGH if BUZZER_ACTIVE_LOW else GPIO.LOW)
 
 def bunyi_buzzer_sync(kali):
-    """Fungsi sinkronus agar bunyi buzzer selesai sempurna sebelum masuk ke jeda waktu"""
     for _ in range(kali):
         set_buzzer(True)
         time.sleep(0.12)
@@ -111,13 +137,14 @@ def bunyi_buzzer_sync(kali):
         time.sleep(0.08)
 
 def reset_semua_komponen_standby():
-    """Mengembalikan perangkat keras ke status mati total saat standby."""
     _relay_set(RELAY_SOLENOID_PIN, False)
     _relay_set(RELAY_DISCHARGE_PIN, False)
     set_led(LED_SCANNING_PIN, False)
     set_led(LED_TERDETEKSI_PIN, False)
     set_led(LED_SALAH_PIN, False)
     set_buzzer(False)
+    # Tampilan awal LCD saat sistem stanby ready
+    lcd_cetak("=== DOOR LOCK ===", "SISTEM AKTIF", "Silahkan Berdiri", "Di Depan Kamera")
 
 reset_semua_komponen_standby()
 
@@ -172,8 +199,9 @@ def train_model():
     return recognizer, label_map
 
 def speech_to_text(status_callback=None):
-    def update(msg):
+    def update(msg, l1="", l2="", l3="", l4=""):
         if status_callback: status_callback(msg)
+        lcd_cetak(l1, l2, l3, l4)
         
     recognizer_sr = sr.Recognizer()
     ID_MIC_ANDA = 2           
@@ -181,23 +209,23 @@ def speech_to_text(status_callback=None):
     
     try:
         with sr.Microphone(device_index=ID_MIC_ANDA, sample_rate=SAMPLE_RATE_MIC) as source:
-            update("Menyesuaikan ambang batas kebisingan...")
+            update("Menyesuaikan ambang batas kebisingan...", "VERIFIKASI SUARA", "Mohon Tenang...", "Kalibrasi Mic...", "")
             recognizer_sr.adjust_for_ambient_noise(source, duration=0.8) 
             
-            update("Silahkan ucapkan password anda...")
+            update("Silahkan ucapkan password anda...", "VERIFIKASI SUARA", "Silahkan Ucapkan", "Password Anda!", "")
             audio = recognizer_sr.listen(source, timeout=4, phrase_time_limit=4)
     except Exception as e:
         print(f"[AUDIO ERROR]: {e}")
         return None
 
-    update("Mengirim audio ke Cloud Google STT...")
+    update("Mengirim audio ke Cloud Google STT...", "VERIFIKASI SUARA", "Memproses Audio...", "Harap Tunggu...", "")
     try:
         return recognizer_sr.recognize_google(audio, language="id-ID")
     except sr.UnknownValueError:
-        update("Google STT gagal menerjemahkan.")
+        update("Google STT gagal menerjemahkan.", "VERIFIKASI GAGAL", "Suara Tidak", "Jelas / Terputus", "")
         return None
     except sr.RequestError:
-        update("Koneksi internet lambat / Cloud Timeout.")
+        update("Koneksi internet lambat / Cloud Timeout.", "VERIFIKASI GAGAL", "Koneksi Internet", "Bermasalah!", "")
         return None
 
 # ============================================================
@@ -247,6 +275,9 @@ class App(tk.Tk):
     def on_close(self):
         self.release_camera()
         reset_semua_komponen_standby()
+        if LCD_AVAILABLE and lcd is not None:
+            lcd.clear()
+            lcd.write_string("Sistem Mati".center(20))
         if GPIO_AVAILABLE: GPIO.cleanup()
         self.destroy()
 
@@ -258,9 +289,6 @@ class App(tk.Tk):
         try: requests.post(WA_API_URL, data=payload, headers=headers, timeout=5)
         except Exception: pass
 
-    # ------------------------------------------------------------------
-    # MENU UTAMA: MONITOR SCANNING
-    # ------------------------------------------------------------------
     def build_sistem_utama(self):
         self.clear_window()
         self.su_recognizer = None
@@ -282,8 +310,10 @@ class App(tk.Tk):
         self.su_recognizer, self.su_label_map = train_model()
         if self.su_recognizer is None:
             self.su_status_var.set("Dataset kosong. Daftarkan wajah Anda terlebih dahulu.")
+            lcd_cetak("=== ERROR ===", "DATASET KOSONG", "Daftarkan Wajah!", "")
         else:
             self.su_status_var.set("Berdiri di depan kamera untuk mendeteksi wajah...")
+            lcd_cetak("=== DOOR LOCK ===", "SISTEM AKTIF", "Silahkan Berdiri", "Di Depan Kamera")
 
         self.start_camera()
         self.update_su_camera()
@@ -306,7 +336,6 @@ class App(tk.Tk):
                     (x, y, w, h) = wajah_utama
                     cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
                     
-                    # Begitu ada wajah terdeteksi awal, kunci state & jalankan alur sekuensial
                     self.su_processing = True
                     threading.Thread(target=self.alur_keamanan_sekuensial, daemon=True).start()
 
@@ -316,37 +345,41 @@ class App(tk.Tk):
         self.camera_after_id = self.after(50, self.update_su_camera)
 
     # ------------------------------------------------------------------
-    # ALUR UTAMA SEKUENSIAL (THREAD SEPARATE AGAR TIME.SLEEP TIDAK LAG)
+    # ALUR UTAMA SEKUENSIAL DENGAN OUTPUT KE LCD 20x4
     # ------------------------------------------------------------------
     def alur_keamanan_sekuensial(self):
-        # 1. Deteksi Awal: Buzzer bunyi 1 kali (Terhubung ke PIN 22)
+        # 1. Deteksi Awal: Buzzer 1x
         bunyi_buzzer_sync(1)
         
-        # 2. Jeda 5 detik untuk mempaskan wajah pada kamera
+        # 2. Jeda 5 detik mempaskan wajah (Ditampilkan hitung mundur di LCD)
         for i in range(5, 0, -1):
             self.su_set_status_threadsafe(f"Wajah terdeteksi! Mengunci posisi kamera dalam {i} detik...")
+            lcd_cetak("WAJAH TERDETEKSI!", "Mohon Paskan Wajah", f"Proses Scan: {i} s", "Jangan Bergerak!")
             time.sleep(1.0)
             
         if self.su_recognizer is None or self.last_frame_bgr is None:
             self.su_finish_threadsafe("Dataset kosong / Gagal memproses gambar.", delay_ms=1000)
             return
 
-        # 3. Ambil foto/frame terbaru setelah jeda untuk pengecekan
+        # 3. Ambil frame setelah jeda 5 detik
         self.su_set_status_threadsafe("Memindai wajah...")
+        lcd_cetak("=== SCANNING ===", "Mencocokkan Data", "Harap Tunggu...", "")
+        
         gray = cv2.cvtColor(self.last_frame_bgr, cv2.COLOR_BGR2GRAY)
         faces = face_cascade.detectMultiScale(gray, 1.3, 5)
         
         if len(faces) == 0:
-            # Jika setelah 5 detik orangnya malah pergi/tidak terdeteksi
             bunyi_buzzer_sync(3)
-            self.su_finish_threadsafe("Pengecekan gagal: Wajah hilang dari kamera!", delay_ms=8000)
+            self.su_set_status_threadsafe("Pengecekan gagal: Wajah hilang dari kamera!")
+            lcd_cetak("=== SCAN GAGAL ===", "Wajah Hilang!", "Kembali ke Awal", "")
+            time.sleep(8.0) # Jeda cooldown 8 detik
+            self.su_reset_processing()
             return
 
         faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
         (x, y, w, h) = faces[0]
         face_img = cv2.resize(gray[y:y + h, x:x + w], FACE_SIZE)
         
-        # Prediksi wajah dengan LBPH
         label, confidence = self.su_recognizer.predict(face_img)
 
         # 4. Pengondisian Kecocokan Dataset Wajah
@@ -354,6 +387,7 @@ class App(tk.Tk):
             # A. WAJAH ADA DI DATASET
             nama_user = self.su_label_map.get(label)
             self.su_set_status_threadsafe(f"Wajah Teridentifikasi: {nama_user}.\nMenyiapkan Verifikasi Suara...")
+            lcd_cetak("WAJAH TERDAFTAR", f"User: {nama_user}", "Membuka Mikrofon", "Bersiaplah...")
             
             # Buzzer bunyi 2 kali
             bunyi_buzzer_sync(2)
@@ -362,11 +396,13 @@ class App(tk.Tk):
             spoken_text = speech_to_text(status_callback=self.su_set_status_threadsafe)
             
             if spoken_text is None:
-                # Anggap gagal tangkap suara sebagai password salah
+                # Gagal tangkap suara / kosong
                 bunyi_buzzer_sync(3)
                 self.su_set_status_threadsafe("ANDA SALAH MEMASUKKAN PASSWORD (SUARA KOSONG)")
+                lcd_cetak("=== AKSES DITOLAK ===", f"User: {nama_user}", "PASSWORD SALAH!", "DISCHARGE AKTIF!")
+                
                 _relay_set(RELAY_DISCHARGE_PIN, True)
-                time.sleep(DURASI_DISCHARGE_DETIK) # Aktif 5 detik
+                time.sleep(DURASI_DISCHARGE_DETIK) # 5 detik
                 _relay_set(RELAY_DISCHARGE_PIN, False)
             else:
                 users = load_users()
@@ -376,32 +412,38 @@ class App(tk.Tk):
                 if stored_hash is not None and stored_hash == input_hash:
                     # B. MICROPHONE BENAR
                     self.su_set_status_threadsafe(f'Suara: "{spoken_text}"\n\nSELAMAT, SILAHKAN MASUK!')
+                    lcd_cetak("=== AKSES DITERIMA ===", f"Halo, {nama_user}", "SILAHKAN MASUK", "PINTU TERBUKA")
+                    
                     bunyi_buzzer_sync(2) # Buzzer bunyi 2 kali
                     
-                    # Solenoid aktif 4 detik lalu mati (PIN 17 - Active Low)
+                    # Solenoid aktif 4 detik
                     _relay_set(RELAY_SOLENOID_PIN, True)
                     time.sleep(DURASI_SOLENOID_DETIK)
                     _relay_set(RELAY_SOLENOID_PIN, False)
                 else:
                     # C. WAJAH BENAR TAPI PASSWORD SALAH
                     self.su_set_status_threadsafe(f'Suara: "{spoken_text}"\n\nANDA SALAH MEMASUKKAN PASSWORD')
+                    lcd_cetak("=== AKSES DITOLAK ===", f"User: {nama_user}", "PASSWORD SALAH!", "DISCHARGE AKTIF!")
+                    
                     bunyi_buzzer_sync(3) # Buzzer bunyi 3 kali
                     self.kirim_notif_wa(nama_user)
                     
-                    # Relay Electric Discharge aktif terhubung ke PIN 27 selama 5 detik lalu mati
+                    # Electric Discharge aktif terhubung ke PIN 27 selama 5 detik
                     _relay_set(RELAY_DISCHARGE_PIN, True)
                     time.sleep(DURASI_DISCHARGE_DETIK)
                     _relay_set(RELAY_DISCHARGE_PIN, False)
         else:
             # D. KAMERA TIDAK ADA DI DATASET (WAJAH ASING)
             self.su_set_status_threadsafe("ANDA BELUM TERDAFTAR (WAJAH ASING)")
+            lcd_cetak("=== STRANGER ===", "WAJAH ASING!", "ANDA TIDAK DIKENAL", "AKSES DITOLAK")
             bunyi_buzzer_sync(3) # Buzzer bunyi 3 kali
 
-        # 5. Begitu selesai seluruh rangkaian proses, kasih jeda pembacaan kamera selama 8 detik (Cooldown)
-        self.su_finish_threadsafe("Sistem Cooling Down... Mengunci deteksi agar tidak berulang.", delay_ms=8000)
-
-    def su_custom_sleep(self, durasi_detik):
-        time.sleep(durasi_detik)
+        # 5. Jeda Cooldown Kamera Selama 8 Detik agar tidak berulang membaca mendadak
+        for c in range(8, 0, -1):
+            self.su_set_status_threadsafe(f"Sistem Cooling Down... Mengunci deteksi ({c}s)")
+            time.sleep(1.0)
+            
+        self.su_reset_processing()
 
     def su_set_status_threadsafe(self, msg):
         self.after(0, lambda: self.su_status_var.set(msg))
@@ -424,6 +466,7 @@ class App(tk.Tk):
     def build_daftar_wajah(self):
         self.clear_window()
         reset_semua_komponen_standby()
+        lcd_cetak("MODE REGISTRASI", "Silahkan Isi Form", "Di Layar Aplikasi", "")
 
         self.dw_nama = None
         self.dw_user_dir = None
@@ -509,6 +552,7 @@ class App(tk.Tk):
         self.dw_btn_mulai.config(state="disabled")
         self.dw_btn_ambil.config(state="normal", text=f"Ambil Foto Sample (0/{MIN_SAMPLES})")
         self.dw_status_var.set("Wajah siap dipindai. Silahkan klik 'Ambil Foto Sample'.")
+        lcd_cetak("MODE REGISTRASI", f"User: {nama}", "Ambil Foto Sampel", "Lewat Aplikasi")
 
     def dw_ambil_foto(self):
         if self.last_frame_bgr is None: return
@@ -530,6 +574,7 @@ class App(tk.Tk):
 
         self.dw_btn_ambil.config(text=f"Ambil Foto Sample ({self.dw_sample_count}/{MIN_SAMPLES})")
         self.dw_status_var.set(f"Foto ke-{self.dw_sample_count} berhasil disimpan.")
+        lcd_cetak("MODE REGISTRASI", f"User: {self.dw_nama}", f"Foto Ke-{self.dw_sample_count} Terambil", "Sukses!")
 
         if self.dw_sample_count >= MIN_SAMPLES:
             self.dw_btn_ambil.config(state="disabled")
