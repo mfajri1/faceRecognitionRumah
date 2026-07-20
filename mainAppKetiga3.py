@@ -69,22 +69,32 @@ except Exception as e:
     print(f"[DFPLAYER WARNING] Gagal terhubung ke modul suara: {e}")
 
 def kirim_perintah_dfplayer(perintah, param1=0x00, param2=0x00):
-    """Mengirim byte perintah standar ke DFPlayer Mini"""
+    """Mengirim byte perintah standar ke DFPlayer Mini dengan pembersihan buffer"""
     if not DFPLAYER_AVAILABLE or df_serial is None: return
+    
+    # Reset buffer serial sebelum mengirim untuk mencegah crash perintah bertumpuk
+    try:
+        df_serial.reset_input_buffer()
+        df_serial.reset_output_buffer()
+    except:
+        pass
+
     paket = bytes([0x7E, 0xFF, 0x06, perintah, 0x00, param1, param2, 0xEF])
     try:
         df_serial.write(paket)
+        df_serial.flush() # Pastikan byte benar-benar terkirim keluar dari TX RPi
     except Exception as e:
         print(f"[DFPLAYER ERROR] Gagal kirim perintah: {e}")
 
 def set_volume(volume):
     """Mengatur volume (0 sampai 30)"""
     kirim_perintah_dfplayer(0x06, 0x00, volume)
-    time.sleep(0.1)
+    time.sleep(0.2) # Ditambah jeda agar modul selesai memproses konfigurasi volume
 
 def putar_lagu(nomor_track):
     """Memutar file MP3 berdasarkan nomor di folder /mp3/"""
     kirim_perintah_dfplayer(0x12, 0x00, nomor_track)
+    time.sleep(0.3) # JEDA KRUSIAL: Beri DFPlayer waktu bernapas untuk meload file dari MicroSD
 
 # ============================================================
 # KONFIGURASI SISTEM & PIN HARDWARE
@@ -449,6 +459,7 @@ class App(tk.Tk):
         
         # Track 2: Wajah Anda Terdeteksi
         putar_lagu(2)
+        time.sleep(1.5) # Beri jeda agar suara "Wajah Anda Terdeteksi" selesai berbunyi
         
         for i in range(3, 0, -1):
             self.su_set_status_threadsafe(f"Wajah terdeteksi! Mengunci posisi kamera dalam {i} detik...")
@@ -477,6 +488,7 @@ class App(tk.Tk):
             bunyi_buzzer_sync(3)
             # Track 3: Wajah Anda Tidak Terdeteksi
             putar_lagu(3)
+            time.sleep(1.5)
             
             self.su_set_status_threadsafe("Pengecekan gagal: Wajah hilang dari kamera!")
             lcd_cetak("=== SCAN GAGAL ===", "Wajah Hilang!", "Mulai Cooldown...", "")
@@ -495,10 +507,11 @@ class App(tk.Tk):
             
             # Track 1: Selamat Datang
             putar_lagu(1)
-            time.sleep(2.0)
+            time.sleep(2.0) # Tunggu ucapan "Selamat Datang" selesai
             
             # Track 4: Silahkan Ucapkan Password
             putar_lagu(4)
+            time.sleep(2.0) # Tunggu ucapan "Silahkan Ucapkan Password" selesai baru buka Mic STT
             
             self.su_set_status_threadsafe(f"Wajah Teridentifikasi: {nama_user}.\nMenyiapkan Verifikasi Suara...")
             lcd_cetak("WAJAH TERDAFTAR", f"User: {nama_user}", "Membuka Mikrofon", "Bersiaplah...")
@@ -510,6 +523,7 @@ class App(tk.Tk):
                 bunyi_buzzer_sync(3)
                 # Track 6: Password Anda Salah
                 putar_lagu(6)
+                time.sleep(1.8)
                 
                 self.su_set_status_threadsafe("ANDA SALAH MEMASUKKAN PASSWORD (SUARA KOSONG)")
                 lcd_cetak("=== AKSES DITOLAK ===", f"User: {nama_user}", "PASSWORD KOSONG!", "DISCHARGE AKTIF!")
@@ -530,6 +544,7 @@ class App(tk.Tk):
                     
                     # Track 7: Terimakasih, Silahkan Masuk
                     putar_lagu(7)
+                    time.sleep(2.2) # Beri waktu suara selesai sebelum solenoid menutup kembali
                     
                     self.su_set_status_threadsafe(f'Suara: "{spoken_text}"\n\nSELAMAT, SILAHKAN MASUK!')
                     lcd_cetak("=== AKSES DITERIMA ===", f"Halo, {nama_user}", "SILAHKAN MASUK", "PINTU TERBUKA")
@@ -544,6 +559,7 @@ class App(tk.Tk):
                     bunyi_buzzer_sync(3)
                     # Track 6: Password Anda Salah
                     putar_lagu(6)
+                    time.sleep(1.8)
                     
                     self.su_set_status_threadsafe(f'Suara: "{spoken_text}"\n\nANDA SALAH MEMASUKKAN PASSWORD')
                     lcd_cetak("=== AKSES DITOLAK ===", f"User: {nama_user}", "PASSWORD SALAH!", "DISCHARGE AKTIF!")
@@ -554,8 +570,9 @@ class App(tk.Tk):
                     _relay_set(RELAY_DISCHARGE_PIN, False)
         else:
             bunyi_buzzer_sync(3)
-            # Track 3: Wajah Anda Tidak Terdeteksi
+            # Track 3: Wajah Anda Tidak Terdeteksi (Orang Asing)
             putar_lagu(3)
+            time.sleep(1.5)
             
             self.su_set_status_threadsafe("ANDA BELUM TERDAFTAR (WAJAH ASING)")
             lcd_cetak("=== STRANGER ===", "WAJAH ASING!", "ANDA TIDAK DIKENAL", "AKSES DITOLAK")
