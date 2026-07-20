@@ -1,7 +1,7 @@
 """
 SISTEM KEAMANAN PINTU: WAJAH + SUARA (EDISI LCD 20X4 I2C RASPBERRY PI)
 ===================================================================
-UPDATED: SHIFTWA INTEGRATION (IMAGE + CAPTION) & 15S COOLDOWN
+UPDATED: MULTI-ANGLE FACE REGISTRATION, SHIFTWA 3-STEP, DFPLAYER TRACK 1-7, & 15S COOLDOWN
 """
 
 import os
@@ -9,6 +9,7 @@ import json
 import hashlib
 import threading
 import time
+import serial
 
 import cv2
 import numpy as np
@@ -46,13 +47,52 @@ except Exception as e:
     lcd = None
     print(f"[LCD WARNING] Gagal memuat LCD (Mode simulasi): {e}")
 
+# --- INTEGRASI AUTOMATIC PATH CASCA DE OPENCV ---
+OPENCV_DATA_DIR = os.path.dirname(cv2.__file__) + "/data/"
+CASCADE_PATH = os.path.join(OPENCV_DATA_DIR, "haarcascade_frontalface_default.xml")
+PROFILE_CASCADE_PATH = os.path.join(OPENCV_DATA_DIR, "haarcascade_profileface.xml")
+
+if not os.path.exists(CASCADE_PATH): CASCADE_PATH = "haarcascade_frontalface_default.xml"
+if not os.path.exists(PROFILE_CASCADE_PATH): PROFILE_CASCADE_PATH = "haarcascade_profileface.xml"
+
+face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
+profile_cascade = cv2.CascadeClassifier(PROFILE_CASCADE_PATH)
+
+# --- INTEGRASI PORT SERIAL UART DFPLAYER MINI ---
+try:
+    df_serial = serial.Serial("/dev/serial0", baudrate=9600, timeout=1)
+    DFPLAYER_AVAILABLE = True
+    print("[DFPLAYER] Modul Suara Serial Aktif.")
+except Exception as e:
+    DFPLAYER_AVAILABLE = False
+    df_serial = None
+    print(f"[DFPLAYER WARNING] Gagal terhubung ke modul suara: {e}")
+
+def kirim_perintah_dfplayer(perintah, param1=0x00, param2=0x00):
+    """Mengirim byte perintah standar ke DFPlayer Mini"""
+    if not DFPLAYER_AVAILABLE or df_serial is None: return
+    paket = bytes([0x7E, 0xFF, 0x06, perintah, 0x00, param1, param2, 0xEF])
+    try:
+        df_serial.write(paket)
+    except Exception as e:
+        print(f"[DFPLAYER ERROR] Gagal kirim perintah: {e}")
+
+def set_volume(volume):
+    """Mengatur volume (0 sampai 30)"""
+    kirim_perintah_dfplayer(0x06, 0x00, volume)
+    time.sleep(0.1)
+
+def putar_lagu(nomor_track):
+    """Memutar file MP3 berdasarkan nomor di folder /mp3/"""
+    kirim_perintah_dfplayer(0x12, 0x00, nomor_track)
+
 # ============================================================
 # KONFIGURASI SISTEM & PIN HARDWARE
 # ============================================================
 
 DATASET_DIR = "dataset" 
 USERS_FILE = "users.json"
-MIN_SAMPLES = 3 
+MIN_SAMPLES = 9 # Dinaikkan menjadi 9 agar bisa memuat sample: 3 lurus, 3 kiri, 3 kanan
 FACE_SIZE = (200, 200) 
 LBPH_THRESHOLD = 70 
 
@@ -64,6 +104,10 @@ COLOR_ACCENT = "#4c6ef5"
 COLOR_ACCENT2 = "#12b886"
 COLOR_DANGER = "#555555"
 
+# --- API ShiftWA Gateway ---
+SHIFTWA_API_KEY = "sk_live_c6acf3b0ea19f134a5617f6a916399173f99b397a910766b75937f6963ad0fba"
+SHIFTWA_BASE_URL = "https://api.shiftwa.dev/v1"
+WA_TARGET = "+6282287770991"
 
 # --- Alokasi PIN GPIO ---
 RELAY_SOLENOID_PIN = 27       # Relay 1 (Solenoid Pintu) - Active Low
@@ -73,7 +117,7 @@ LED_TERDETEKSI_PIN = 24
 LED_SALAH_PIN = 25            
 
 DURASI_SOLENOID_DETIK = 4
-DURASI_DISCHARGE_DETIK = 5    
+DURASI_DISCHARGE_DETIK = 6    
 
 RELAY_ACTIVE_LOW = True
 BUZZER_ACTIVE_LOW = False
@@ -137,11 +181,6 @@ def reset_semua_komponen_standby():
     set_buzzer(False)
     lcd_cetak("=== DOOR LOCK ===", "SISTEM AKTIF", "Silahkan Berdiri", "Di Depan Kamera")
 
-CASCADE_PATH = "haarcascade_frontalface_default.xml"
-PROFILE_CASCADE_PATH = "haarcascade_profileface.xml" # <- Tambahkan ini
-face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
-profile_cascade = cv2.CascadeClassifier(PROFILE_CASCADE_PATH) # <- Tambahkan ini
-
 # ============================================================
 # LOGIKA DATABASE DAN PEMROSESAN
 # ============================================================
@@ -195,7 +234,7 @@ def speech_to_text(status_callback=None):
         lcd_cetak(l1, l2, l3, l4)
         
     recognizer_sr = sr.Recognizer()
-    ID_MIC_ANDA = 2           
+    ID_MIC_ANDA = 2            
     SAMPLE_RATE_MIC = 48000   
     
     try:
@@ -236,7 +275,7 @@ class App(tk.Tk):
         self.cam = None
         self.camera_after_id = None
         self.last_frame_bgr = None
-        self.cooldown_start_time = None  # State Waktu Cooldown Keamanan
+        self.cooldown_start_time = None  
         
         reset_semua_komponen_standby()
         self.build_sistem_utama()
@@ -275,7 +314,6 @@ class App(tk.Tk):
         if GPIO_AVAILABLE: GPIO.cleanup()
         self.destroy()
 
-    # --- FUNGSI ASYNC SHIFTWA (3-STEP UPLOAD) ---
     def kirim_shiftwa_async(self, nama_user, status_akses, photo_path="pintu_log.jpg"):
         def target():
             if requests is None or not os.path.exists(photo_path): return
@@ -298,7 +336,6 @@ class App(tk.Tk):
                 filename = os.path.basename(photo_path)
                 file_size = os.path.getsize(photo_path)
                 
-                # Langkah 1: Minta URL upload tiket
                 metadata = {"mime": "image/jpeg", "size": file_size, "filename": filename}
                 res1 = requests.post(f"{SHIFTWA_BASE_URL}/messages/upload", headers=headers_auth, json=metadata, timeout=10)
                 
@@ -309,13 +346,11 @@ class App(tk.Tk):
                 
                 if not upload_url or not storage_key: return
                 
-                # Langkah 2: PUT byte gambar
                 with open(photo_path, "rb") as raw_file:
                     res2 = requests.put(upload_url, headers={"Content-Type": "image/jpeg"}, data=raw_file, timeout=20)
                     
                 if res2.status_code not in (200, 201, 204): return
                 
-                # Langkah 3: Kirim Media Message
                 payload = {"to": WA_TARGET, "media": {"storageKey": storage_key, "caption": caption}}
                 requests.post(f"{SHIFTWA_BASE_URL}/messages/send", headers=headers_auth, json=payload, timeout=10)
                 print("[SHIFTWA] Log Keamanan Berhasil Dikirim!")
@@ -348,6 +383,7 @@ class App(tk.Tk):
             lcd_cetak("=== ERROR ===", "DATASET KOSONG", "Daftarkan Wajah!", "")
         else:
             self.su_status_var.set("Berdiri di depan kamera untuk mendeteksi wajah...")
+            reset_semua_komponen_standby()
 
         self.start_camera()
         self.update_su_camera()
@@ -355,7 +391,7 @@ class App(tk.Tk):
     def update_su_camera(self):
         if self.cam is None: return
         
-        # JEDA KEAMANAN 15 DETIK CONTROL LOGIC
+        # --- JEDA KEAMANAN AMAN LOCK SPAM (15 DETIK) ---
         if self.cooldown_start_time is not None:
             sisa_jeda = 15.0 - (time.time() - self.cooldown_start_time)
             if sisa_jeda > 0:
@@ -379,7 +415,19 @@ class App(tk.Tk):
             self.last_frame_bgr = frame.copy()
             display = frame.copy()
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # Deteksi multi-angle di sistem utama
             faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+            if len(faces) == 0:
+                faces = profile_cascade.detectMultiScale(gray, 1.3, 5)
+                if len(faces) == 0:
+                    flipped_gray = cv2.flip(gray, 1)
+                    flipped_faces = profile_cascade.detectMultiScale(flipped_gray, 1.3, 5)
+                    if len(flipped_faces) > 0:
+                        w_img = gray.shape[1]
+                        faces = []
+                        for (xf, yf, wf, hf) in flipped_faces:
+                            faces.append([w_img - xf - wf, yf, wf, hf])
             
             if not self.su_processing and len(faces) > 0:
                 faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
@@ -396,7 +444,11 @@ class App(tk.Tk):
         self.camera_after_id = self.after(50, self.update_su_camera)
 
     def alur_keamanan_sekuensial(self):
+        set_volume(25)
         bunyi_buzzer_sync(1)
+        
+        # Track 2: Wajah Anda Terdeteksi
+        putar_lagu(2)
         
         for i in range(3, 0, -1):
             self.su_set_status_threadsafe(f"Wajah terdeteksi! Mengunci posisi kamera dalam {i} detik...")
@@ -412,9 +464,20 @@ class App(tk.Tk):
         
         gray = cv2.cvtColor(self.last_frame_bgr, cv2.COLOR_BGR2GRAY)
         faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+        if len(faces) == 0:
+            faces = profile_cascade.detectMultiScale(gray, 1.3, 5)
+            if len(faces) == 0:
+                flipped_gray = cv2.flip(gray, 1)
+                flipped_faces = profile_cascade.detectMultiScale(flipped_gray, 1.3, 5)
+                if len(flipped_faces) > 0:
+                    w_img = gray.shape[1]
+                    faces = [[w_img - flipped_faces[0][0] - flipped_faces[0][2], flipped_faces[0][1], flipped_faces[0][2], flipped_faces[0][3]]]
         
         if len(faces) == 0:
             bunyi_buzzer_sync(3)
+            # Track 3: Wajah Anda Tidak Terdeteksi
+            putar_lagu(3)
+            
             self.su_set_status_threadsafe("Pengecekan gagal: Wajah hilang dari kamera!")
             lcd_cetak("=== SCAN GAGAL ===", "Wajah Hilang!", "Mulai Cooldown...", "")
             self.cooldown_start_time = time.time()
@@ -425,12 +488,18 @@ class App(tk.Tk):
         face_img = cv2.resize(gray[y:y + h, x:x + w], FACE_SIZE)
         
         label, confidence = self.su_recognizer.predict(face_img)
-
-        # Simpan capture log untuk lampiran ShiftWA
         cv2.imwrite("pintu_log.jpg", self.last_frame_bgr)
 
         if confidence < LBPH_THRESHOLD:
             nama_user = self.su_label_map.get(label)
+            
+            # Track 1: Selamat Datang
+            putar_lagu(1)
+            time.sleep(2.0)
+            
+            # Track 4: Silahkan Ucapkan Password
+            putar_lagu(4)
+            
             self.su_set_status_threadsafe(f"Wajah Teridentifikasi: {nama_user}.\nMenyiapkan Verifikasi Suara...")
             lcd_cetak("WAJAH TERDAFTAR", f"User: {nama_user}", "Membuka Mikrofon", "Bersiaplah...")
             
@@ -439,6 +508,9 @@ class App(tk.Tk):
             
             if spoken_text is None:
                 bunyi_buzzer_sync(3)
+                # Track 6: Password Anda Salah
+                putar_lagu(6)
+                
                 self.su_set_status_threadsafe("ANDA SALAH MEMASUKKAN PASSWORD (SUARA KOSONG)")
                 lcd_cetak("=== AKSES DITOLAK ===", f"User: {nama_user}", "PASSWORD KOSONG!", "DISCHARGE AKTIF!")
                 
@@ -452,6 +524,13 @@ class App(tk.Tk):
                 input_hash = hash_password(spoken_text)
                 
                 if stored_hash is not None and stored_hash == input_hash:
+                    # Track 5: Password Anda Benar
+                    putar_lagu(5)
+                    time.sleep(2.0) 
+                    
+                    # Track 7: Terimakasih, Silahkan Masuk
+                    putar_lagu(7)
+                    
                     self.su_set_status_threadsafe(f'Suara: "{spoken_text}"\n\nSELAMAT, SILAHKAN MASUK!')
                     lcd_cetak("=== AKSES DITERIMA ===", f"Halo, {nama_user}", "SILAHKAN MASUK", "PINTU TERBUKA")
                     
@@ -462,23 +541,28 @@ class App(tk.Tk):
                     time.sleep(DURASI_SOLENOID_DETIK)
                     _relay_set(RELAY_SOLENOID_PIN, False)
                 else:
+                    bunyi_buzzer_sync(3)
+                    # Track 6: Password Anda Salah
+                    putar_lagu(6)
+                    
                     self.su_set_status_threadsafe(f'Suara: "{spoken_text}"\n\nANDA SALAH MEMASUKKAN PASSWORD')
                     lcd_cetak("=== AKSES DITOLAK ===", f"User: {nama_user}", "PASSWORD SALAH!", "DISCHARGE AKTIF!")
                     
-                    bunyi_buzzer_sync(3) 
                     self.kirim_shiftwa_async(nama_user, f"AKSES DITOLAK: PASSWORD SALAH ('{spoken_text}')")
-                    
                     _relay_set(RELAY_DISCHARGE_PIN, True)
                     time.sleep(DURASI_DISCHARGE_DETIK)
                     _relay_set(RELAY_DISCHARGE_PIN, False)
         else:
+            bunyi_buzzer_sync(3)
+            # Track 3: Wajah Anda Tidak Terdeteksi
+            putar_lagu(3)
+            
             self.su_set_status_threadsafe("ANDA BELUM TERDAFTAR (WAJAH ASING)")
             lcd_cetak("=== STRANGER ===", "WAJAH ASING!", "ANDA TIDAK DIKENAL", "AKSES DITOLAK")
-            bunyi_buzzer_sync(3)
             self.kirim_shiftwa_async("Stranger / Orang Asing", "AKSES DITOLAK: WAJAH TIDAK DIKENAL")
             time.sleep(2)
 
-        # Masuk mode jeda keamanan 15 detik setelah semua proses selesai
+        # Memicu Mode Jeda Keamanan 15 Detik
         self.cooldown_start_time = time.time()
 
     def su_set_status_threadsafe(self, msg):
@@ -537,25 +621,18 @@ class App(tk.Tk):
             display = frame.copy()
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             
-            # 1. Coba deteksi wajah lurus (Frontal) dulu
             faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-            
-            # 2. Jika wajah lurus tidak ketemu, cari wajah miring/samping (Profile)
             if len(faces) == 0:
                 faces = profile_cascade.detectMultiScale(gray, 1.3, 5)
-                # Jaga-jaga jika menghadap ke arah sebaliknya (karena profile cascade bawaan condong ke satu arah), 
-                # kita flip gambarnya secara horizontal untuk mencari sudut sebaliknya.
                 if len(faces) == 0:
                     flipped_gray = cv2.flip(gray, 1)
                     flipped_faces = profile_cascade.detectMultiScale(flipped_gray, 1.3, 5)
                     if len(flipped_faces) > 0:
-                        # Kembalikan koordinat wajah yang di-flip ke koordinat asli
                         w_img = gray.shape[1]
                         faces = []
                         for (xf, yf, wf, hf) in flipped_faces:
                             faces.append([w_img - xf - wf, yf, wf, hf])
             
-            # Jika salah satu ketemu (lurus/kiri/kanan), gambar kotak hijau di GUI
             if len(faces) > 0:
                 faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
                 (x, y, w, h) = faces[0]
@@ -591,14 +668,15 @@ class App(tk.Tk):
         self.dw_entry_password.config(state="disabled")
         self.dw_btn_mulai.config(state="disabled")
         self.dw_btn_ambil.config(state="normal", text=f"Ambil Foto Sample (0/{MIN_SAMPLES})")
-        self.dw_status_var.set("Wajah siap dipindai. Silahkan klik 'Ambil Foto Sample'.")
+        
+        msg = f"Wajah siap dipindai. Kumpulkan {MIN_SAMPLES} sampel (Lurus, Kiri, Kanan)."
+        self.dw_status_var.set(msg)
         lcd_cetak("MODE REGISTRASI", f"User: {nama}", "Ambil Foto Sampel", "Lewat Aplikasi")
 
     def dw_ambil_foto(self):
         if self.last_frame_bgr is None: return
         gray = cv2.cvtColor(self.last_frame_bgr, cv2.COLOR_BGR2GRAY)
         
-        # Lakukan pencarian multi-angle yang sama saat tombol ditekan
         faces = face_cascade.detectMultiScale(gray, 1.3, 5)
         if len(faces) == 0:
             faces = profile_cascade.detectMultiScale(gray, 1.3, 5)
@@ -610,7 +688,7 @@ class App(tk.Tk):
                     faces = [[w_img - flipped_faces[0][0] - flipped_faces[0][2], flipped_faces[0][1], flipped_faces[0][2], flipped_faces[0][3]]]
 
         if len(faces) == 0:
-            self.dw_status_var.set("Wajah tidak terdeteksi oleh sensor kamera (Coba sesuaikan sudut)!")
+            self.dw_status_var.set("Wajah tidak terdeteksi oleh sensor kamera!")
             return
 
         faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
@@ -623,7 +701,16 @@ class App(tk.Tk):
         cv2.imwrite(filename, face_img)
 
         self.dw_btn_ambil.config(text=f"Ambil Foto Sample ({self.dw_sample_count}/{MIN_SAMPLES})")
-        self.dw_status_var.set(f"Foto ke-{self.dw_sample_count} berhasil disimpan.")
+        
+        # Berikan panduan dinamis di status bar berdasarkan jumlah sampel terkumpul
+        if self.dw_sample_count <= 3:
+            dw_msg = f"Sampel {self.dw_sample_count}/9 disimpan. Tetap posisi LURUS."
+        elif self.dw_sample_count <= 6:
+            dw_msg = f"Sampel {self.dw_sample_count}/9 disimpan. Sekarang menolehlah ke KIRI."
+        else:
+            dw_msg = f"Sampel {self.dw_sample_count}/9 disimpan. Sekarang menolehlah ke KANAN."
+            
+        self.dw_status_var.set(dw_msg)
         lcd_cetak("MODE REGISTRASI", f"User: {self.dw_nama}", f"Foto Ke-{self.dw_sample_count} Terambil", "Sukses!")
 
         if self.dw_sample_count >= MIN_SAMPLES:
