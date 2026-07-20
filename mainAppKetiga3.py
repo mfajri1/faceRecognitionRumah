@@ -64,6 +64,7 @@ COLOR_ACCENT = "#4c6ef5"
 COLOR_ACCENT2 = "#12b886"
 COLOR_DANGER = "#555555"
 
+
 # --- Alokasi PIN GPIO ---
 RELAY_SOLENOID_PIN = 27       # Relay 1 (Solenoid Pintu) - Active Low
 RELAY_DISCHARGE_PIN = 23      # Relay 2 (Electric Discharge)
@@ -137,7 +138,9 @@ def reset_semua_komponen_standby():
     lcd_cetak("=== DOOR LOCK ===", "SISTEM AKTIF", "Silahkan Berdiri", "Di Depan Kamera")
 
 CASCADE_PATH = "haarcascade_frontalface_default.xml"
+PROFILE_CASCADE_PATH = "haarcascade_profileface.xml" # <- Tambahkan ini
 face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
+profile_cascade = cv2.CascadeClassifier(PROFILE_CASCADE_PATH) # <- Tambahkan ini
 
 # ============================================================
 # LOGIKA DATABASE DAN PEMROSESAN
@@ -533,8 +536,26 @@ class App(tk.Tk):
             self.last_frame_bgr = frame.copy()
             display = frame.copy()
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # 1. Coba deteksi wajah lurus (Frontal) dulu
             faces = face_cascade.detectMultiScale(gray, 1.3, 5)
             
+            # 2. Jika wajah lurus tidak ketemu, cari wajah miring/samping (Profile)
+            if len(faces) == 0:
+                faces = profile_cascade.detectMultiScale(gray, 1.3, 5)
+                # Jaga-jaga jika menghadap ke arah sebaliknya (karena profile cascade bawaan condong ke satu arah), 
+                # kita flip gambarnya secara horizontal untuk mencari sudut sebaliknya.
+                if len(faces) == 0:
+                    flipped_gray = cv2.flip(gray, 1)
+                    flipped_faces = profile_cascade.detectMultiScale(flipped_gray, 1.3, 5)
+                    if len(flipped_faces) > 0:
+                        # Kembalikan koordinat wajah yang di-flip ke koordinat asli
+                        w_img = gray.shape[1]
+                        faces = []
+                        for (xf, yf, wf, hf) in flipped_faces:
+                            faces.append([w_img - xf - wf, yf, wf, hf])
+            
+            # Jika salah satu ketemu (lurus/kiri/kanan), gambar kotak hijau di GUI
             if len(faces) > 0:
                 faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
                 (x, y, w, h) = faces[0]
@@ -576,10 +597,20 @@ class App(tk.Tk):
     def dw_ambil_foto(self):
         if self.last_frame_bgr is None: return
         gray = cv2.cvtColor(self.last_frame_bgr, cv2.COLOR_BGR2GRAY)
+        
+        # Lakukan pencarian multi-angle yang sama saat tombol ditekan
         faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+        if len(faces) == 0:
+            faces = profile_cascade.detectMultiScale(gray, 1.3, 5)
+            if len(faces) == 0:
+                flipped_gray = cv2.flip(gray, 1)
+                flipped_faces = profile_cascade.detectMultiScale(flipped_gray, 1.3, 5)
+                if len(flipped_faces) > 0:
+                    w_img = gray.shape[1]
+                    faces = [[w_img - flipped_faces[0][0] - flipped_faces[0][2], flipped_faces[0][1], flipped_faces[0][2], flipped_faces[0][3]]]
 
         if len(faces) == 0:
-            self.dw_status_var.set("Wajah tidak terdeteksi oleh sensor kamera!")
+            self.dw_status_var.set("Wajah tidak terdeteksi oleh sensor kamera (Coba sesuaikan sudut)!")
             return
 
         faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
