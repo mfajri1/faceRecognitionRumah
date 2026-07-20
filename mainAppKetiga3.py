@@ -64,11 +64,6 @@ COLOR_ACCENT = "#4c6ef5"
 COLOR_ACCENT2 = "#12b886"
 COLOR_DANGER = "#555555"
 
-# --- API ShiftWA Gateway ---
-SHIFTWA_API_KEY = "sk_live_c6acf3b0ea19f134a5617f6a916399173f99b397a910766b75937f6963ad0fba"
-SHIFTWA_BASE_URL = "https://api.shiftwa.dev/v1"
-WA_TARGET = "+628136554516" # Format internasional diawali +
-
 # --- Alokasi PIN GPIO ---
 RELAY_SOLENOID_PIN = 27       # Relay 1 (Solenoid Pintu) - Active Low
 RELAY_DISCHARGE_PIN = 23      # Relay 2 (Electric Discharge)
