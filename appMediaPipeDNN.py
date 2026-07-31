@@ -13,7 +13,6 @@ import json
 import hashlib
 import threading
 import time
-import serial
 import random
 import urllib.request
 
@@ -79,41 +78,6 @@ except Exception as e:
     DNN_AVAILABLE = False
     print(f"[DNN WARNING] Gagal memuat model DNN: {e}")
 
-# --- INTEGRASI PORT SERIAL UART DFPLAYER MINI ---
-try:
-    df_serial = serial.Serial("/dev/serial0", baudrate=9600, timeout=1)
-    DFPLAYER_AVAILABLE = True
-    print("[DFPLAYER] Modul Suara Serial Aktif.")
-except Exception as e:
-    DFPLAYER_AVAILABLE = False
-    df_serial = None
-    print(f"[DFPLAYER WARNING] Gagal terhubung ke modul suara: {e}")
-
-def kirim_perintah_dfplayer(perintah, param1=0x00, param2=0x00):
-    if not DFPLAYER_AVAILABLE or df_serial is None: 
-        return
-    versi, panjang, feedback = 0xFF, 0x06, 0x00
-    jumlah = versi + panjang + perintah + feedback + param1 + param2
-    checksum = 0xFFFF - jumlah + 1
-    high_byte = (checksum >> 8) & 0xFF
-    low_byte = checksum & 0xFF
-    paket = bytes([0x7E, versi, panjang, perintah, feedback, param1, param2, high_byte, low_byte, 0xEF])
-    
-    try:
-        df_serial.reset_input_buffer()
-        df_serial.reset_output_buffer()
-        df_serial.write(paket)
-        df_serial.flush()
-    except Exception as e:
-        print(f"[DFPLAYER ERROR] Gagal kirim perintah: {e}")
-
-def set_volume(volume):
-    kirim_perintah_dfplayer(0x06, 0x00, volume)
-    time.sleep(0.2)
-
-def putar_lagu(nomor_track):
-    kirim_perintah_dfplayer(0x12, 0x00, nomor_track)
-    time.sleep(0.3)
 
 # ============================================================
 # KONFIGURASI SISTEM & PIN HARDWARE
@@ -138,7 +102,8 @@ ADMIN_PASSWORD_DEFAULT = "admin123"
 
 SHIFTWA_API_KEY = "sk_live_50a3b10f8561a3615fd8e4db49094369b80855066da5a92066ad1102a15ac20c"
 SHIFTWA_BASE_URL = "https://api.shiftwa.dev/v1"
-WA_TARGET = "+6281267978173"
+
+WA_TARGET = "+628136554516"
 
 RELAY_SOLENOID_PIN = 27       # Relay 1 (Solenoid Pintu)
 RELAY_DISCHARGE_PIN = 23      # Relay 2 (Electric Discharge)
@@ -161,44 +126,60 @@ def normalisasi_cahaya(gray_crop):
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return clahe.apply(gray_crop)
 
+# ============================================================
+# DETEKTOR WAJAH MANDIRI (STABIL & AMAN UNTUK RASPI 3B+)
+# ============================================================
+HAAR_XML = "haarcascade_frontalface_default.xml"
+HAAR_URL = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
+
+if not os.path.exists(HAAR_XML):
+    print("[HAAR] Mengunduh file haarcascade_frontalface_default.xml lokal...")
+    try:
+        import urllib.request
+        urllib.request.urlretrieve(HAAR_URL, HAAR_XML)
+    except Exception as e:
+        print(f"[HAAR ERROR] Gagal mengunduh XML: {e}")
+
+face_cascade = cv2.CascadeClassifier(HAAR_XML)
+
 def dapatkan_wajah_terbesar(frame_bgr):
     """
-    Menggunakan OpenCV DNN SSD untuk deteksi wajah presisi.
-    Sangat cocok untuk Raspi 3B+ (cepat, stabil, dan tahan sudut miring).
+    Mendeteksi wajah menggunakan Haar Cascade lokal yang ringan dan stabil di Raspi 3B+.
+    Melakukan downscaling frame untuk pemrosesan cepat (anti lag).
     """
-    if frame_bgr is None or not DNN_AVAILABLE:
+    if frame_bgr is None or face_cascade.empty():
         return None
 
     h_orig, w_orig = frame_bgr.shape[:2]
     
-    # Deteksi DNN menggunakan blob 300x300
-    blob = cv2.dnn.blobFromImage(cv2.resize(frame_bgr, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
-    dnn_net.setInput(blob)
-    detections = dnn_net.forward()
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    small_gray = cv2.resize(gray, (320, 240))
+    
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    small_gray = clahe.apply(small_gray)
 
-    faces = []
-    for i in range(0, detections.shape[2]):
-        confidence = detections[0, 0, i, 2]
-        
-        # Ambang keyakinan minimal 50%
-        if confidence > 0.5:
-            box = detections[0, 0, i, 3:7] * np.array([w_orig, h_orig, w_orig, h_orig])
-            (startX, startY, endX, endY) = box.astype("int")
+    faces_haar = face_cascade.detectMultiScale(
+        small_gray, 
+        scaleFactor=1.1, 
+        minNeighbors=4, 
+        minSize=(30, 30)
+    )
 
-            x = max(0, startX)
-            y = max(0, startY)
-            w = min(endX - startX, w_orig - x)
-            h = min(endY - startY, h_orig - y)
+    if len(faces_haar) > 0:
+        scale_x = w_orig / 320.0
+        scale_y = h_orig / 240.0
+        faces_rescaled = []
+        for (sx, sy, sw, sh) in faces_haar:
+            x = int(sx * scale_x)
+            y = int(sy * scale_y)
+            w = int(sw * scale_x)
+            h = int(sh * scale_y)
+            faces_rescaled.append((x, y, w, h))
+            
+        faces_rescaled = sorted(faces_rescaled, key=lambda f: f[2] * f[3], reverse=True)
+        return faces_rescaled[0]
 
-            if w > 20 and h > 20:
-                faces.append((x, y, w, h))
-
-    if not faces:
-        return None
-
-    # Urutkan berdasarkan area terbesar (wajah terdekat)
-    faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-    return faces[0]
+    return None
 
 def lcd_cetak(baris1="", baris2="", baris3="", baris4=""):
     if not LCD_AVAILABLE or lcd is None:
@@ -559,6 +540,7 @@ class App(tk.Tk):
     def update_su_camera(self):
         if self.cam is None: return
         
+        # Penanganan Cooldown / Lock
         if self.cooldown_start_time is not None:
             sisa_jeda = 7.0 - (time.time() - self.cooldown_start_time)
             if sisa_jeda > 0:
@@ -582,14 +564,19 @@ class App(tk.Tk):
             self.last_frame_bgr = frame.copy()
             display = frame.copy()
             
+            # Cari wajah
             wajah = dapatkan_wajah_terbesar(frame)
             
-            if not self.su_processing and wajah is not None:
+            # GAMBAR KOTAK HIJAU REAL-TIME (Selalu digambar selama wajah ada)
+            if wajah is not None:
                 (x, y, w, h) = wajah
                 cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.putText(display, "Wajah Terdeteksi", (x, max(y - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 
-                self.su_processing = True
-                threading.Thread(target=self.alur_keamanan_sekuensial, daemon=True).start()
+                # Triggers proses keamanan jika belum berjalan
+                if not self.su_processing:
+                    self.su_processing = True
+                    threading.Thread(target=self.alur_keamanan_sekuensial, daemon=True).start()
 
             try: self.render_frame(display, self.su_video_label)
             except tk.TclError: return
@@ -597,11 +584,7 @@ class App(tk.Tk):
         self.camera_after_id = self.after(40, self.update_su_camera)
 
     def alur_keamanan_sekuensial(self):
-        set_volume(25)
         bunyi_buzzer_sync(1)
-        
-        putar_lagu(2)  # Track 2: Wajah Anda Terdeteksi
-        time.sleep(1.5) 
         
         for i in range(3, 0, -1):
             self.su_set_status_threadsafe(f"Wajah terdeteksi! Memindai dalam {i} detik...")
@@ -642,11 +625,6 @@ class App(tk.Tk):
             self.su_set_status_threadsafe(f"WAJAH TERDETEKSI: Welcome {nama_user}!\nSELAMAT, SILAHKAN MASUK!")
             lcd_cetak("=== AKSES DITERIMA ===", f"Halo, {nama_user}", "SILAHKAN MASUK", "PINTU TERBUKA")
             
-            putar_lagu(1)
-            time.sleep(1.8)
-            putar_lagu(7)
-            time.sleep(2.0)
-            
             bunyi_buzzer_sync(2)
             _relay_set(RELAY_SOLENOID_PIN, True)
             time.sleep(DURASI_SOLENOID_DETIK)
@@ -659,10 +637,6 @@ class App(tk.Tk):
         # TAHAP 2: WAJAH ASING -> VERIFIKASI SUARA (FALLBACK)
         # -----------------------------------------------------------------
         bunyi_buzzer_sync(2)
-        putar_lagu(3)
-        time.sleep(1.5)
-        putar_lagu(4)
-        time.sleep(2.0)
         
         self.su_set_status_threadsafe("Wajah tidak dikenal / tidak terdeteksi!\nMembuka mikrofon, silahkan ucapkan password suara...")
         lcd_cetak("WAJAH TIDAK DIKENAL", "Gunakan Password", "Silahkan Ucapkan", "Password Suara!")
@@ -685,11 +659,6 @@ class App(tk.Tk):
                     break
 
         if password_benar:
-            putar_lagu(5)
-            time.sleep(1.8)
-            putar_lagu(7)
-            time.sleep(2.0)
-            
             self.su_set_status_threadsafe(f'Suara: "{spoken_text}"\nPASSWORD BENAR (User: {nama_user})! SILAHKAN MASUK!')
             lcd_cetak("=== AKSES DITERIMA ===", f"User: {nama_user}", "PASSWORD BENAR", "PINTU TERBUKA")
             
@@ -700,8 +669,6 @@ class App(tk.Tk):
 
         else:
             bunyi_buzzer_sync(3)
-            putar_lagu(6)
-            time.sleep(1.8)
             
             teks_log = spoken_text if spoken_text else "Suara Tidak Terdeteksi / Kosong"
             self.su_set_status_threadsafe(f'Suara: "{teks_log}"\nPASSWORD SALAH! ELECTRIC DISCHARGE AKTIF (6s)!')
