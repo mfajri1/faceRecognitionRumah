@@ -6,7 +6,7 @@ SISTEM KEAMANAN PINTU: WAJAH (OPENCV DNN) + SUARA
    - Password Suara Benar -> Solenoid Aktif (Pintu Terbuka)
    - Password Suara Salah -> Electric Discharge 6s + Kirim Notifikasi WA
 3. Pilihan ID Mic Dinamis + Auto-Detect Wireless Mic + Visualisator Spektrum
-4. Fitur Kelola & Hapus User Terdaftar (Admin Mode) + Retrain Model Otomatis
+4. Fitur Kelola & Hapus User Terdaftar (Admin Mode) - FIXED BUTTON & POPUP
 """
 
 import os
@@ -123,7 +123,6 @@ BUZZER_ACTIVE_LOW = False
 # ============================================================
 
 def normalisasi_cahaya(gray_crop):
-    """Meratakan pencahayaan dengan CLAHE agar tahan berpindah ruangan."""
     clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
     return clahe.apply(gray_crop)
 
@@ -453,7 +452,7 @@ class App(tk.Tk):
         threading.Thread(target=target, daemon=True).start()
 
     # ============================================================
-    # 1. HALAMAN UTAMA (SISTEM UTAMA WAJAH OPENCV DNN)
+    # 1. HALAMAN UTAMA
     # ============================================================
     def build_sistem_utama(self):
         self.clear_window()
@@ -609,9 +608,6 @@ class App(tk.Tk):
                     wajah_terverifikasi = True
                     nama_user = self.su_label_map.get(label, "User")
 
-        # -----------------------------------------------------------------
-        # TAHAP 1: WAJAH TERDETEKSI -> BUKA PINTU
-        # -----------------------------------------------------------------
         if wajah_terverifikasi:
             self.su_set_status_threadsafe(f"WAJAH TERDETEKSI: Welcome {nama_user}!\nSELAMAT, SILAHKAN MASUK!")
             lcd_cetak("=== AKSES DITERIMA ===", f"Halo, {nama_user}", "SILAHKAN MASUK", "PINTU TERBUKA")
@@ -624,11 +620,7 @@ class App(tk.Tk):
             self.cooldown_start_time = time.time()
             return
 
-        # -----------------------------------------------------------------
-        # TAHAP 2: WAJAH ASING -> VERIFIKASI SUARA (FALLBACK)
-        # -----------------------------------------------------------------
         bunyi_buzzer_sync(2)
-        
         self.su_set_status_threadsafe("Wajah tidak dikenal / tidak terdeteksi!\nMembuka mikrofon, silahkan ucapkan password suara...")
         lcd_cetak("WAJAH TIDAK DIKENAL", "Gunakan Password", "Silahkan Ucapkan", "Password Suara!")
         
@@ -678,7 +670,7 @@ class App(tk.Tk):
         self.after(0, lambda: self.su_status_var.set(msg))
 
     # ============================================================
-    # 2. HALAMAN LOGIN ADMIN (VERIFIKASI)
+    # 2. HALAMAN LOGIN ADMIN
     # ============================================================
     def build_login_admin(self):
         self.clear_window()
@@ -755,7 +747,7 @@ class App(tk.Tk):
         self.dw_btn_mulai = tk.Button(form_frame, text="Mulai Daftar", font=("Segoe UI", 11, "bold"), bg=COLOR_ACCENT, fg="white", relief="flat", command=self.dw_mulai)
         self.dw_btn_mulai.grid(row=0, column=2, rowspan=2, padx=10)
 
-        # FITUR BARU: TOMBOL KELOLA USER TERDAFTAR
+        # TOMBOL KELOLA USER (SELALU AKTIF)
         self.btn_kelola_user = tk.Button(form_frame, text="📋 Kelola User", font=("Segoe UI", 11, "bold"), bg="#f59f00", fg="white", relief="flat", command=self.buka_kelola_user)
         self.btn_kelola_user.grid(row=0, column=3, rowspan=2, padx=5)
 
@@ -774,102 +766,106 @@ class App(tk.Tk):
         self.update_dw_camera()
 
     # ============================================================
-    # JENDELA POP-UP: KELOLA & HAPUS USER TERDAFTAR
+    # POP-UP KELOLA & HAPUS USER TERDAFTAR (REVISI PERBAIKAN)
     # ============================================================
     def buka_kelola_user(self):
-        popup = tk.Toplevel(self)
-        popup.title("Daftar User Terdaftar")
-        popup.geometry("450x400")
-        popup.resizable(False, False)
-        popup.configure(bg=COLOR_BG)
-        popup.transient(self)
-        popup.grab_set()
+        try:
+            popup = tk.Toplevel(self)
+            popup.title("Daftar User Terdaftar")
+            popup.geometry("480x420")
+            popup.resizable(False, False)
+            popup.configure(bg=COLOR_BG)
+            popup.transient(self)
+            popup.focus_set()
 
-        tk.Label(popup, text="DAFTAR USER TERDAFTAR", font=("Segoe UI", 14, "bold"), bg=COLOR_BG, fg=COLOR_TEXT).pack(pady=15)
+            tk.Label(popup, text="DAFTAR USER TERDAFTAR", font=("Segoe UI", 14, "bold"), bg=COLOR_BG, fg=COLOR_TEXT).pack(pady=15)
 
-        # Listbox untuk menampilkan user
-        frame_list = tk.Frame(popup, bg=COLOR_BG)
-        frame_list.pack(pady=5, fill="both", expand=True, padx=20)
+            frame_list = tk.Frame(popup, bg=COLOR_BG)
+            frame_list.pack(pady=5, fill="both", expand=True, padx=20)
 
-        scrollbar = tk.Scrollbar(frame_list)
-        scrollbar.pack(side="right", fill="y")
+            scrollbar = tk.Scrollbar(frame_list)
+            scrollbar.pack(side="right", fill="y")
 
-        listbox_user = tk.Listbox(frame_list, font=("Segoe UI", 11), yscrollcommand=scrollbar.set, bg="#2b2b3d", fg=COLOR_TEXT, selectbackground=COLOR_ACCENT, selectforeground="white", highlightthickness=0)
-        listbox_user.pack(side="left", fill="both", expand=True)
-        scrollbar.config(command=listbox_user.yview)
-
-        def muat_daftar_user():
-            listbox_user.delete(0, tk.END)
-            users = load_users()
-            
-            # Gabungkan user dari users.json dan folder dataset
-            daftar_nama = set(users.keys())
-            if os.path.exists(DATASET_DIR):
-                for folder in os.listdir(DATASET_DIR):
-                    if os.path.isdir(os.path.join(DATASET_DIR, folder)):
-                        daftar_nama.add(folder)
-
-            if not daftar_nama:
-                listbox_user.insert(tk.END, " (Belum ada user terdaftar) ")
-                listbox_user.config(state="disabled")
-            else:
-                listbox_user.config(state="normal")
-                for idx, nama in enumerate(sorted(daftar_nama), 1):
-                    # Hitung jumlah sampel foto
-                    path_folder = os.path.join(DATASET_DIR, nama)
-                    jml_foto = len([f for f in os.listdir(path_folder) if f.lower().endswith((".jpg", ".png"))]) if os.path.exists(path_folder) else 0
-                    listbox_user.insert(tk.END, f"{idx}. {nama}  ({jml_foto} Sampel Foto)")
-
-        def hapus_user_terpilih():
-            terpilih = listbox_user.curselection()
-            if not terpilih:
-                messagebox.showwarning("Peringatan", "Pilih nama user yang ingin dihapus terlebih dahulu!", parent=popup)
-                return
-
-            teks_item = listbox_user.get(terpilih[0])
-            if "Belum ada user" in teks_item: return
-
-            # Ambil nama user
-            nama_target = teks_item.split(". ")[1].split("  (")[0].strip()
-
-            konfirmasi = messagebox.askyesno(
-                "Konfirmasi Hapus", 
-                f"Apakah Anda yakin ingin menghapus user '{nama_target}'?\nSemua foto dataset dan password user ini akan dihapus permanen!", 
-                parent=popup
+            listbox_user = tk.Listbox(
+                frame_list, 
+                font=("Segoe UI", 11), 
+                yscrollcommand=scrollbar.set, 
+                bg="#2b2b3d", 
+                fg=COLOR_TEXT, 
+                selectbackground=COLOR_ACCENT, 
+                selectforeground="white", 
+                highlightthickness=0
             )
+            listbox_user.pack(side="left", fill="both", expand=True)
+            scrollbar.config(command=listbox_user.yview)
 
-            if konfirmasi:
-                # 1. Hapus folder dataset
-                path_folder = os.path.join(DATASET_DIR, nama_target)
-                if os.path.exists(path_folder):
-                    shutil.rmtree(path_folder)
-
-                # 2. Hapus dari users.json
+            def muat_daftar_user():
+                listbox_user.delete(0, tk.END)
                 users = load_users()
-                if nama_target in users:
-                    del users[nama_target]
-                    save_users(users)
-
-                # 3. Melatih ulang model LBPH dengan sisa dataset yang ada
-                self.su_recognizer, self.su_label_map = train_model()
-
-                bunyi_buzzer_sync(2)
-                messagebox.showinfo("Sukses", f"User '{nama_target}' berhasil dihapus dan model keamanan telah diperbarui!", parent=popup)
                 
-                # Refresh listbox
-                muat_daftar_user()
-                
-                # Perbarui status di layar utama registrasi
-                self.dw_status_var.set(f"User '{nama_target}' terhapus. Model otomatis dilatih ulang.")
-                lcd_cetak("USER TERHAPUS", f"User: {nama_target}", "Model Keamanan", "Di-update Otomatis!")
+                daftar_nama = set(users.keys())
+                if os.path.exists(DATASET_DIR):
+                    for folder in os.listdir(DATASET_DIR):
+                        if os.path.isdir(os.path.join(DATASET_DIR, folder)):
+                            daftar_nama.add(folder)
 
-        muat_daftar_user()
+                if not daftar_nama:
+                    listbox_user.insert(tk.END, " (Belum ada user terdaftar) ")
+                else:
+                    for idx, nama in enumerate(sorted(daftar_nama), 1):
+                        path_folder = os.path.join(DATASET_DIR, nama)
+                        jml_foto = len([f for f in os.listdir(path_folder) if f.lower().endswith((".jpg", ".png"))]) if os.path.exists(path_folder) else 0
+                        listbox_user.insert(tk.END, f"{idx}. {nama}  ({jml_foto} Sampel Foto)")
 
-        btn_frame_popup = tk.Frame(popup, bg=COLOR_BG)
-        btn_frame_popup.pack(pady=15)
+            def hapus_user_terpilih():
+                terpilih = listbox_user.curselection()
+                if not terpilih:
+                    messagebox.showwarning("Peringatan", "Pilih nama user yang ingin dihapus terlebih dahulu!", parent=popup)
+                    return
 
-        tk.Button(btn_frame_popup, text="🗑️ Hapus User Selected", font=("Segoe UI", 11, "bold"), bg=COLOR_DANGER, fg="white", relief="flat", padx=10, pady=5, command=hapus_user_terpilih).pack(side="left", padx=10)
-        tk.Button(btn_frame_popup, text="Tutup", font=("Segoe UI", 11), bg="#5c5f66", fg="white", relief="flat", padx=15, pady=5, command=popup.destroy).pack(side="left", padx=10)
+                teks_item = listbox_user.get(terpilih[0])
+                if "Belum ada user" in teks_item: return
+
+                nama_target = teks_item.split(". ")[1].split("  (")[0].strip()
+
+                konfirmasi = messagebox.askyesno(
+                    "Konfirmasi Hapus", 
+                    f"Apakah Anda yakin ingin menghapus user '{nama_target}'?\nSemua foto dataset dan password user ini akan dihapus permanen!", 
+                    parent=popup
+                )
+
+                if konfirmasi:
+                    # 1. Hapus folder dataset
+                    path_folder = os.path.join(DATASET_DIR, nama_target)
+                    if os.path.exists(path_folder):
+                        shutil.rmtree(path_folder)
+
+                    # 2. Hapus dari users.json
+                    users = load_users()
+                    if nama_target in users:
+                        del users[nama_target]
+                        save_users(users)
+
+                    # 3. Retrain model LBPH
+                    self.su_recognizer, self.su_label_map = train_model()
+
+                    bunyi_buzzer_sync(2)
+                    messagebox.showinfo("Sukses", f"User '{nama_target}' berhasil dihapus dan model keamanan telah diperbarui!", parent=popup)
+                    
+                    muat_daftar_user()
+                    self.dw_status_var.set(f"User '{nama_target}' terhapus. Model otomatis dilatih ulang.")
+                    lcd_cetak("USER TERHAPUS", f"User: {nama_target}", "Model Keamanan", "Di-update Otomatis!")
+
+            muat_daftar_user()
+
+            btn_frame_popup = tk.Frame(popup, bg=COLOR_BG)
+            btn_frame_popup.pack(pady=15)
+
+            tk.Button(btn_frame_popup, text="🗑️ Hapus User Selected", font=("Segoe UI", 11, "bold"), bg=COLOR_DANGER, fg="white", relief="flat", padx=10, pady=5, command=hapus_user_terpilih).pack(side="left", padx=10)
+            tk.Button(btn_frame_popup, text="Tutup", font=("Segoe UI", 11), bg="#5c5f66", fg="white", relief="flat", padx=15, pady=5, command=popup.destroy).pack(side="left", padx=10)
+
+        except Exception as e:
+            print(f"[POPUP ERROR] Gagal membuka pop-up kelola user: {e}")
 
     def update_dw_camera(self):
         if self.cam is None: return
@@ -912,7 +908,8 @@ class App(tk.Tk):
         self.dw_entry_nama.config(state="disabled")
         self.dw_entry_password.config(state="disabled")
         self.dw_btn_mulai.config(state="disabled")
-        self.btn_kelola_user.config(state="disabled")
+        # TETAP PERTAHANKAN BUTTON KELOLA USER AKTIF (STATE = NORMAL)
+        self.btn_kelola_user.config(state="normal")
         self.dw_btn_ambil.config(state="normal", text=f"Ambil Foto Sample (0/{MIN_SAMPLES})")
         
         msg = f"Wajah siap dipindai. Kumpulkan {MIN_SAMPLES} sampel (Lurus, Kiri, Kanan)."
