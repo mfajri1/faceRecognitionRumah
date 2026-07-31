@@ -6,7 +6,7 @@ SISTEM KEAMANAN PINTU: WAJAH (OPENCV DNN) + SUARA + SUARA SPEAKER & SERVO DOOR
    - Cross-check Wajah & Password
    - Password Suara Benar -> Solenoid + Servo Aktif (Pintu Terbuka 2s) -> Tertutup
    - Password Suara Salah -> Electric Discharge 6s + Kirim Notifikasi WA + Peringatan Suara Speaker
-3. Suara Pengumuman Speaker (gTTS + Pygame)
+3. Suara Pengumuman Speaker Offline (mpg123) - Menunggu Selesai (Synchronous)
 4. Servo Motor Terhubung di GPIO 24
 """
 
@@ -35,15 +35,6 @@ try:
     import requests
 except ImportError:
     requests = None  
-
-try:
-    from gtts import gTTS
-    import pygame
-    pygame.mixer.init()
-    TTS_AVAILABLE = True
-except ImportError:
-    TTS_AVAILABLE = False
-    print("[TTS WARNING] Library 'gTTS' atau 'pygame' belum terinstall. Jalankan: pip install gTTS pygame")
 
 try:
     import RPi.GPIO as GPIO
@@ -120,7 +111,7 @@ WA_TARGET = "+628136554516"
 RELAY_SOLENOID_PIN = 27       # Relay 1 (Solenoid Pintu)
 RELAY_DISCHARGE_PIN = 23      # Relay 2 (Electric Discharge)
 BUZZER_PIN = 22               # Buzzer Peringatan
-SERVO_PIN = 24                # Servo Pintu (MENGGANTIKAN LED)
+SERVO_PIN = 24                # Servo Pintu
 
 DURASI_SOLENOID_DETIK = 2      # Pintu terbuka selama 2 detik
 DURASI_DISCHARGE_DETIK = 6     
@@ -129,33 +120,38 @@ RELAY_ACTIVE_LOW = True
 BUZZER_ACTIVE_LOW = False
 
 # ============================================================
-# HELPER SUARA SPEAKER (TTS)
+# HELPER SUARA SPEAKER (TTS OFFLINE DENGAN JEDA PENUH)
 # ============================================================
 
+AUDIO_MAP = {
+    "Selamat datang pada sistem keamanan pintar": "welcome",
+    "Silakan dekatkan wajah Anda ke kamera": "posisi_wajah",
+    "Wajah Anda terdaftar, silakan masuk": "wajah_ok",
+    "Wajah tidak dikenal. Silakan ucapkan kata sandi suara Anda": "minta_password",
+    "Kata sandi benar, silakan masuk": "pass_benar",
+    "Peringatan! Kata sandi salah. Akses ditolak": "pass_salah",
+    "Mode registrasi aktif. Silakan ikuti petunjuk posisi wajah di layar": "mode_reg",
+    "Registrasi wajah berhasil disimpan": "reg_sukses"
+}
+
 def bukatts(teks):
-    """Memutar suara ucapan teks Bahasa Indonesia ke speaker"""
+    """
+    Memutar file suara MP3 lokal secara Synchronous (menunggu audio selesai diputar),
+    mencegah bentrok dengan perekaman mic atau perintah hardware berikutnya.
+    """
     print(f"[SPEAKER TTS]: '{teks}'")
-    if not TTS_AVAILABLE:
-        return
-
-    def _speak():
-        try:
-            filename = f"temp_tts_{random.randint(1000,9999)}.mp3"
-            tts = gTTS(text=teks, lang='id', slow=False)
-            tts.save(filename)
-            
-            pygame.mixer.music.load(filename)
-            pygame.mixer.music.play()
-            while pygame.mixer.music.get_busy():
-                time.sleep(0.05)
-            pygame.mixer.music.unload()
-            
-            if os.path.exists(filename):
-                os.remove(filename)
-        except Exception as e:
-            print(f"[TTS ERROR] Gagal memutar suara speaker: {e}")
-
-    threading.Thread(target=_speak, daemon=True).start()
+    key_file = AUDIO_MAP.get(teks)
+    
+    if key_file:
+        file_path = os.path.join("audio", f"{key_file}.mp3")
+        if os.path.exists(file_path):
+            # os.system akan MENAHAN/MENUNGGU eksekusi program sampai mpg123 selesai berbunyi
+            os.system(f"mpg123 -q {file_path}")
+            time.sleep(0.3) # Jeda pengaman agar gema suara di ruangan hilang sebelum perintah berikutnya
+        else:
+            print(f"[TTS ERROR] File '{file_path}' tidak ditemukan di folder audio/!")
+    else:
+        print(f"[TTS WARNING] Teks '{teks}' belum terdaftar di AUDIO_MAP!")
 
 # ============================================================
 # UTILITAS DETEKSI WAJAH & HARDWARE
@@ -234,7 +230,6 @@ if GPIO_AVAILABLE:
     for pin in [RELAY_SOLENOID_PIN, RELAY_DISCHARGE_PIN, BUZZER_PIN, SERVO_PIN]:
         GPIO.setup(pin, GPIO.OUT)
 
-    # Inisialisasi PWM Servo di GPIO 24 (50Hz)
     servo_pwm = GPIO.PWM(SERVO_PIN, 50)
     servo_pwm.start(0)
 else:
@@ -309,7 +304,6 @@ def dapatkan_daftar_mic():
 
 def dapatkan_index_mic_otomatis():
     mics = dapatkan_daftar_mic()
-    # Prioritaskan ID Mic 45 sesuai perangkat HDMI/Audio pengguna
     for idx, _ in mics:
         if idx == 45:
             return 45
@@ -442,8 +436,8 @@ class App(tk.Tk):
         reset_semua_komponen_standby()
         self.build_sistem_utama()
         
-        # Suara sambutan saat sistem pertama kali dinyalakan
-        bukatts("Selamat datang pada sistem keamanan pintar")
+        # Suara sambutan diputar di background thread agar startup GUI tidak tertahan
+        threading.Thread(target=lambda: bukatts("Selamat datang pada sistem keamanan pintar"), daemon=True).start()
 
     def clear_window(self):
         if self.camera_after_id is not None:
@@ -651,6 +645,8 @@ class App(tk.Tk):
     def alur_keamanan_sekuensial(self):
         try:
             bunyi_buzzer_sync(1)
+            
+            # Putar audio & tunggu sampai benar-benar SELESAI
             bukatts("Silakan dekatkan wajah Anda ke kamera")
             
             for i in range(3, 0, -1):
@@ -692,6 +688,8 @@ class App(tk.Tk):
                 lcd_cetak("=== AKSES DITERIMA ===", f"Halo, {nama_user}", "SILAHKAN MASUK", "PINTU TERBUKA")
                 
                 bunyi_buzzer_sync(2)
+                
+                # Ucapkan salam dahulu sampai selesai baru buka pintu
                 bukatts("Wajah Anda terdaftar, silakan masuk")
                 
                 # Buka Solenoid + Servo Pintu 2 Detik Lalu Tutup Otomatis
@@ -702,6 +700,8 @@ class App(tk.Tk):
             # TAHAP 2: VERIFIKASI SUARA (VERIFIKASI SILANG WAJAH & PASSWORD)
             # -----------------------------------------------------------------
             bunyi_buzzer_sync(2)
+            
+            # PENTING: Speaker berucap dahulu sampai tuntas, baru perekaman mic dibuka
             bukatts("Wajah tidak dikenal. Silakan ucapkan kata sandi suara Anda")
             
             self.su_set_status_threadsafe("Wajah belum terverifikasi!\nMembuka mikrofon, silahkan ucapkan password suara anda...")
@@ -837,7 +837,8 @@ class App(tk.Tk):
         self.clear_window()
         reset_semua_komponen_standby()
         lcd_cetak("MODE REGISTRASI", "Silahkan Isi Form", "Di Layar Aplikasi", "")
-        bukatts("Mode registrasi aktif. Silakan ikuti petunjuk posisi wajah di layar")
+        
+        threading.Thread(target=lambda: bukatts("Mode registrasi aktif. Silakan ikuti petunjuk posisi wajah di layar"), daemon=True).start()
 
         self.dw_nama = None
         self.dw_user_dir = None
@@ -1066,7 +1067,7 @@ class App(tk.Tk):
             
             self.su_recognizer, self.su_label_map = train_model()
             
-            bukatts("Registrasi wajah berhasil disimpan")
+            threading.Thread(target=lambda: bukatts("Registrasi wajah berhasil disimpan"), daemon=True).start()
             messagebox.showinfo("Sukses", f"Registrasi wajah '{self.dw_nama}' selesai! Model telah diperbarui.")
             self.build_sistem_utama()
 
