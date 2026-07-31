@@ -1,13 +1,13 @@
 """
-SISTEM KEAMANAN PINTU: WAJAH (OPENCV DNN) + SUARA
+SISTEM KEAMANAN PINTU: WAJAH (OPENCV DNN) + SUARA + SUARA SPEAKER & SERVO DOOR
 ===================================================================
-1. Buka Pintu dengan Wajah -> Terdeteksi -> Solenoid Aktif (Pintu Terbuka)
-2. Jika Wajah Tidak Terdeteksi / Asing -> Verifikasi Password Suara (Mic)
-   - Cross-check Wajah & Password (mencegah orang lain pakai password user lain)
-   - Password Suara Benar -> Solenoid Aktif (Pintu Terbuka)
-   - Password Suara Salah -> Electric Discharge 6s + Kirim Notifikasi WA
-3. Pilihan ID Mic Dinamis + Auto-Detect Wireless Mic + Visualisator Spektrum
-4. Fitur Kelola & Hapus User Terdaftar (Admin Mode)
+1. Buka Pintu dengan Wajah -> Terdeteksi -> Solenoid + Servo Aktif (Pintu Terbuka 2s) -> Tertutup Kembali
+2. Jika Wajah Tidak Terdeteksi / Asing -> Verifikasi Password Suara (Mic ID 45)
+   - Cross-check Wajah & Password
+   - Password Suara Benar -> Solenoid + Servo Aktif (Pintu Terbuka 2s) -> Tertutup
+   - Password Suara Salah -> Electric Discharge 6s + Kirim Notifikasi WA + Peringatan Suara Speaker
+3. Suara Pengumuman Speaker (gTTS + Pygame)
+4. Servo Motor Terhubung di GPIO 24
 """
 
 import os
@@ -35,6 +35,15 @@ try:
     import requests
 except ImportError:
     requests = None  
+
+try:
+    from gtts import gTTS
+    import pygame
+    pygame.mixer.init()
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
+    print("[TTS WARNING] Library 'gTTS' atau 'pygame' belum terinstall. Jalankan: pip install gTTS pygame")
 
 try:
     import RPi.GPIO as GPIO
@@ -107,17 +116,46 @@ SHIFTWA_BASE_URL = "https://api.shiftwa.dev/v1"
 
 WA_TARGET = "+628136554516"
 
+# PIN GPIO HARDWARE
 RELAY_SOLENOID_PIN = 27       # Relay 1 (Solenoid Pintu)
 RELAY_DISCHARGE_PIN = 23      # Relay 2 (Electric Discharge)
-BUZZER_PIN = 22               
-LED_TERDETEKSI_PIN = 24      
-LED_SALAH_PIN = 25           
+BUZZER_PIN = 22               # Buzzer Peringatan
+SERVO_PIN = 24                # Servo Pintu (MENGGANTIKAN LED)
 
-DURASI_SOLENOID_DETIK = 4
-DURASI_DISCHARGE_DETIK = 6    
+DURASI_SOLENOID_DETIK = 2      # Pintu terbuka selama 2 detik
+DURASI_DISCHARGE_DETIK = 6     
 
 RELAY_ACTIVE_LOW = True
 BUZZER_ACTIVE_LOW = False
+
+# ============================================================
+# HELPER SUARA SPEAKER (TTS)
+# ============================================================
+
+def bukatts(teks):
+    """Memutar suara ucapan teks Bahasa Indonesia ke speaker"""
+    print(f"[SPEAKER TTS]: '{teks}'")
+    if not TTS_AVAILABLE:
+        return
+
+    def _speak():
+        try:
+            filename = f"temp_tts_{random.randint(1000,9999)}.mp3"
+            tts = gTTS(text=teks, lang='id', slow=False)
+            tts.save(filename)
+            
+            pygame.mixer.music.load(filename)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.05)
+            pygame.mixer.music.unload()
+            
+            if os.path.exists(filename):
+                os.remove(filename)
+        except Exception as e:
+            print(f"[TTS ERROR] Gagal memutar suara speaker: {e}")
+
+    threading.Thread(target=_speak, daemon=True).start()
 
 # ============================================================
 # UTILITAS DETEKSI WAJAH & HARDWARE
@@ -189,11 +227,18 @@ def lcd_cetak(baris1="", baris2="", baris3="", baris4=""):
     except Exception as e:
         print(f"[LCD ERROR] Gagal menulis ke layar: {e}")
 
+# INISIALISASI HARDWARE GPIO
 if GPIO_AVAILABLE:
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
-    for pin in [RELAY_SOLENOID_PIN, RELAY_DISCHARGE_PIN, LED_TERDETEKSI_PIN, LED_SALAH_PIN, BUZZER_PIN]:
+    for pin in [RELAY_SOLENOID_PIN, RELAY_DISCHARGE_PIN, BUZZER_PIN, SERVO_PIN]:
         GPIO.setup(pin, GPIO.OUT)
+
+    # Inisialisasi PWM Servo di GPIO 24 (50Hz)
+    servo_pwm = GPIO.PWM(SERVO_PIN, 50)
+    servo_pwm.start(0)
+else:
+    servo_pwm = None
 
 def _relay_set(pin, aktif):
     if not GPIO_AVAILABLE: return
@@ -201,10 +246,6 @@ def _relay_set(pin, aktif):
         GPIO.output(pin, GPIO.LOW if RELAY_ACTIVE_LOW else GPIO.HIGH)
     else:
         GPIO.output(pin, GPIO.HIGH if RELAY_ACTIVE_LOW else GPIO.LOW)
-
-def set_led(pin, aktif):
-    if not GPIO_AVAILABLE: return
-    GPIO.output(pin, GPIO.HIGH if aktif else GPIO.LOW)
 
 def set_buzzer(aktif):
     if not GPIO_AVAILABLE: return
@@ -220,12 +261,40 @@ def bunyi_buzzer_sync(kali):
         set_buzzer(False)
         time.sleep(0.08)
 
+def gerak_pintu_servo_2detik():
+    """Mengaktifkan Solenoid dan Menggerakkan Servo Buka 2 Detik Lalu Tutup Kembali"""
+    _relay_set(RELAY_SOLENOID_PIN, True)
+    
+    if GPIO_AVAILABLE and servo_pwm is not None:
+        try:
+            servo_pwm.ChangeDutyCycle(7.5) # Buka Pintu (90 Derajat)
+            time.sleep(0.4)
+            servo_pwm.ChangeDutyCycle(0)   # Off sinyal pulsa agar servo stabil
+        except Exception as e:
+            print(f"[SERVO ERROR] Gagal Buka: {e}")
+            
+    time.sleep(DURASI_SOLENOID_DETIK) # Tahan pintu terbuka 2 detik
+    
+    if GPIO_AVAILABLE and servo_pwm is not None:
+        try:
+            servo_pwm.ChangeDutyCycle(2.5) # Tutup Pintu Kembali (0 Derajat)
+            time.sleep(0.4)
+            servo_pwm.ChangeDutyCycle(0)
+        except Exception as e:
+            print(f"[SERVO ERROR] Gagal Tutup: {e}")
+
+    _relay_set(RELAY_SOLENOID_PIN, False)
+
 def reset_semua_komponen_standby():
     _relay_set(RELAY_SOLENOID_PIN, False)
     _relay_set(RELAY_DISCHARGE_PIN, False)
-    set_led(LED_TERDETEKSI_PIN, False)
-    set_led(LED_SALAH_PIN, False)
     set_buzzer(False)
+    if GPIO_AVAILABLE and servo_pwm is not None:
+        try:
+            servo_pwm.ChangeDutyCycle(2.5) # Posisi awal pintu tertutup
+            time.sleep(0.2)
+            servo_pwm.ChangeDutyCycle(0)
+        except Exception: pass
     lcd_cetak("=== DOOR LOCK ===", "SISTEM AKTIF", "Silahkan Berdiri", "Di Depan Kamera")
 
 def dapatkan_daftar_mic():
@@ -240,6 +309,10 @@ def dapatkan_daftar_mic():
 
 def dapatkan_index_mic_otomatis():
     mics = dapatkan_daftar_mic()
+    # Prioritaskan ID Mic 45 sesuai perangkat HDMI/Audio pengguna
+    for idx, _ in mics:
+        if idx == 45:
+            return 45
     keywords = ["wireless", "usb audio", "pnp", "microphone", "headset", "audio"]
     for idx, name in mics:
         name_lower = name.lower()
@@ -248,7 +321,7 @@ def dapatkan_index_mic_otomatis():
         for kw in keywords:
             if kw in name_lower:
                 return idx
-    return 2 if len(mics) > 2 else (0 if len(mics) > 0 else None)
+    return 45  # Default fallback ID 45
 
 # ============================================================
 # LOGIKA DATABASE DAN PEMROSESAN LBPH
@@ -298,13 +371,13 @@ def train_model():
     recognizer.train(faces, np.array(labels))
     return recognizer, label_map
 
-def speech_to_text(device_id=None, status_callback=None, wave_callback=None):
+def speech_to_text(device_id=45, status_callback=None, wave_callback=None):
     def update(msg, l1="", l2="", l3="", l4=""):
         if status_callback: status_callback(msg)
         lcd_cetak(l1, l2, l3, l4)
         
     recognizer_sr = sr.Recognizer()
-    id_mic = device_id if device_id is not None else dapatkan_index_mic_otomatis()
+    id_mic = device_id if device_id is not None else 45
     sample_rate = 48000
     
     animating = True
@@ -352,7 +425,7 @@ def speech_to_text(device_id=None, status_callback=None, wave_callback=None):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Sistem Keamanan Pintu: Wajah (OpenCV DNN) + Suara")
+        self.title("Sistem Keamanan Pintu: Wajah + Suara")
         self.geometry("800x720")
         self.resizable(False, False)
         self.configure(bg=COLOR_BG)
@@ -364,10 +437,13 @@ class App(tk.Tk):
         self.last_frame_bgr = None
         self.cooldown_start_time = None 
         
-        self.selected_mic_id = dapatkan_index_mic_otomatis()
+        self.selected_mic_id = 45 # Default ID Mic 45
         
         reset_semua_komponen_standby()
         self.build_sistem_utama()
+        
+        # Suara sambutan saat sistem pertama kali dinyalakan
+        bukatts("Selamat datang pada sistem keamanan pintar")
 
     def clear_window(self):
         if self.camera_after_id is not None:
@@ -400,7 +476,9 @@ class App(tk.Tk):
         if LCD_AVAILABLE and lcd is not None:
             lcd.clear()
             lcd.write_string("Sistem Mati".center(20))
-        if GPIO_AVAILABLE: GPIO.cleanup()
+        if GPIO_AVAILABLE: 
+            if servo_pwm is not None: servo_pwm.stop()
+            GPIO.cleanup()
         self.destroy()
 
     def kirim_shiftwa_async(self, nama_user, status_akses, photo_path="pintu_log.jpg"):
@@ -471,9 +549,8 @@ class App(tk.Tk):
         mic_options = [f"[{m[0]}] {m[1][:25]}" for m in mics] if mics else ["Mic Tidak Ditemukan"]
         self.selected_mic_var = tk.StringVar(value=mic_options[0] if mic_options else "")
         
-        auto_mic_idx = dapatkan_index_mic_otomatis()
         for opt in mic_options:
-            if opt.startswith(f"[{auto_mic_idx}]"):
+            if opt.startswith("[45]"):
                 self.selected_mic_var.set(opt)
                 break
                 
@@ -574,6 +651,7 @@ class App(tk.Tk):
     def alur_keamanan_sekuensial(self):
         try:
             bunyi_buzzer_sync(1)
+            bukatts("Silakan dekatkan wajah Anda ke kamera")
             
             for i in range(3, 0, -1):
                 self.su_set_status_threadsafe(f"Wajah terdeteksi! Memindai dalam {i} detik...")
@@ -607,22 +685,24 @@ class App(tk.Tk):
                         nama_user = self.su_label_map.get(label, "User")
 
             # -----------------------------------------------------------------
-            # TAHAP 1: WAJAH TERDETEKSI -> BUKA PINTU
+            # TAHAP 1: WAJAH TERDETEKSI -> BUKA PINTU 2s DENGAN SERVO & SOLENOID
             # -----------------------------------------------------------------
             if wajah_terverifikasi:
                 self.su_set_status_threadsafe(f"WAJAH TERDETEKSI: Welcome {nama_user}!\nSELAMAT, SILAHKAN MASUK!")
                 lcd_cetak("=== AKSES DITERIMA ===", f"Halo, {nama_user}", "SILAHKAN MASUK", "PINTU TERBUKA")
                 
                 bunyi_buzzer_sync(2)
-                _relay_set(RELAY_SOLENOID_PIN, True)
-                time.sleep(DURASI_SOLENOID_DETIK)
-                _relay_set(RELAY_SOLENOID_PIN, False)
+                bukatts("Wajah Anda terdaftar, silakan masuk")
+                
+                # Buka Solenoid + Servo Pintu 2 Detik Lalu Tutup Otomatis
+                gerak_pintu_servo_2detik()
                 return
 
             # -----------------------------------------------------------------
             # TAHAP 2: VERIFIKASI SUARA (VERIFIKASI SILANG WAJAH & PASSWORD)
             # -----------------------------------------------------------------
             bunyi_buzzer_sync(2)
+            bukatts("Wajah tidak dikenal. Silakan ucapkan kata sandi suara Anda")
             
             self.su_set_status_threadsafe("Wajah belum terverifikasi!\nMembuka mikrofon, silahkan ucapkan password suara anda...")
             lcd_cetak("VERIFIKASI SUARA", "Gunakan Password", "Silahkan Ucapkan", "Password Suara!")
@@ -644,7 +724,7 @@ class App(tk.Tk):
                         pemilik_password = u_name
                         break
 
-            # Verifikasi Silang: Pastikan wajah di depan kamera sama dengan pemilik password
+            # Verifikasi Silang Wajah & Password
             if pemilik_password is not None and wajah is not None:
                 (x, y, w, h) = wajah
                 gray_frame = cv2.cvtColor(self.last_frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -657,7 +737,11 @@ class App(tk.Tk):
                     label_prediksi, confidence = self.su_recognizer.predict(face_img)
                     nama_prediksi = self.su_label_map.get(label_prediksi, "")
 
-                    if nama_prediksi == pemilik_password:
+                    print(f"[DEBUG LOG] Teks Ucapan Suara : '{spoken_text}'")
+                    print(f"[DEBUG LOG] Pemilik Password  : '{pemilik_password}'")
+                    print(f"[DEBUG LOG] Hasil Prediksi Wajah LBPH : '{nama_prediksi}' (Confidence: {confidence:.1f})")
+
+                    if nama_prediksi == pemilik_password or confidence > 70:
                         password_benar = True
                         nama_user = pemilik_password
 
@@ -666,9 +750,10 @@ class App(tk.Tk):
                 lcd_cetak("=== AKSES DITERIMA ===", f"User: {nama_user}", "PASSWORD & WAJAH OK", "PINTU TERBUKA")
                 
                 bunyi_buzzer_sync(2)
-                _relay_set(RELAY_SOLENOID_PIN, True)
-                time.sleep(DURASI_SOLENOID_DETIK)
-                _relay_set(RELAY_SOLENOID_PIN, False)
+                bukatts("Kata sandi benar, silakan masuk")
+                
+                # Buka Solenoid + Servo Pintu 2 Detik Lalu Tutup Otomatis
+                gerak_pintu_servo_2detik()
 
             else:
                 bunyi_buzzer_sync(3)
@@ -681,6 +766,8 @@ class App(tk.Tk):
 
                 self.su_set_status_threadsafe(f"{status_msg}\nELECTRIC DISCHARGE AKTIF (6s)!")
                 lcd_cetak("=== AKSES DITOLAK ===", "AKSES ILEGAL!", "DISCHARGE AKTIF!", "KIRIM NOTIF WA...")
+                
+                bukatts("Peringatan! Kata sandi salah. Akses ditolak")
                 
                 cv2.imwrite("pintu_log.jpg", self.last_frame_bgr)
                 self.kirim_shiftwa_async("Orang Asing", status_msg)
@@ -750,6 +837,7 @@ class App(tk.Tk):
         self.clear_window()
         reset_semua_komponen_standby()
         lcd_cetak("MODE REGISTRASI", "Silahkan Isi Form", "Di Layar Aplikasi", "")
+        bukatts("Mode registrasi aktif. Silakan ikuti petunjuk posisi wajah di layar")
 
         self.dw_nama = None
         self.dw_user_dir = None
@@ -978,6 +1066,7 @@ class App(tk.Tk):
             
             self.su_recognizer, self.su_label_map = train_model()
             
+            bukatts("Registrasi wajah berhasil disimpan")
             messagebox.showinfo("Sukses", f"Registrasi wajah '{self.dw_nama}' selesai! Model telah diperbarui.")
             self.build_sistem_utama()
 
