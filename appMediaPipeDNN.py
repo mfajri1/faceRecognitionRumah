@@ -6,6 +6,7 @@ SISTEM KEAMANAN PINTU: WAJAH (OPENCV DNN) + SUARA
    - Password Suara Benar -> Solenoid Aktif (Pintu Terbuka)
    - Password Suara Salah -> Electric Discharge 6s + Kirim Notifikasi WA
 3. Pilihan ID Mic Dinamis + Auto-Detect Wireless Mic + Visualisator Spektrum
+4. Fitur Kelola & Hapus User Terdaftar (Admin Mode) + Retrain Model Otomatis
 """
 
 import os
@@ -14,6 +15,7 @@ import hashlib
 import threading
 import time
 import random
+import shutil
 import urllib.request
 
 import cv2
@@ -52,14 +54,13 @@ except Exception as e:
     lcd = None
     print(f"[LCD WARNING] Gagal memuat LCD (Mode simulasi): {e}")
 
-# --- INTEGRASI OPENCV DNN FACE DETECTOR (RINGAN & SANGAT AKURAT) ---
+# --- INTEGRASI OPENCV DNN FACE DETECTOR ---
 PROTO_URL = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
 MODEL_URL = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
 
 PROTO_PATH = "deploy.prototxt"
 MODEL_PATH = "res10_300x300_ssd_iter_140000.caffemodel"
 
-# Unduh berkas model secara otomatis jika belum ada
 if not os.path.exists(PROTO_PATH):
     print("[DNN] Mengunduh deploy.prototxt...")
     try: urllib.request.urlretrieve(PROTO_URL, PROTO_PATH)
@@ -87,7 +88,7 @@ DATASET_DIR = "dataset"
 USERS_FILE = "users.json"
 MIN_SAMPLES = 9 
 FACE_SIZE = (200, 200) 
-LBPH_THRESHOLD = 60  # Threshold fleksibel terhadap intensitas cahaya
+LBPH_THRESHOLD = 52  # Threshold ideal menolak orang asing dan akurat di berbagai cahaya
 
 VIDEO_DISPLAY_SIZE = (480, 270) 
 
@@ -123,11 +124,11 @@ BUZZER_ACTIVE_LOW = False
 
 def normalisasi_cahaya(gray_crop):
     """Meratakan pencahayaan dengan CLAHE agar tahan berpindah ruangan."""
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
     return clahe.apply(gray_crop)
 
 # ============================================================
-# DETEKTOR WAJAH MANDIRI (STABIL & AMAN UNTUK RASPI 3B+)
+# DETEKTOR WAJAH HAAR CASCADE LOKAL
 # ============================================================
 HAAR_XML = "haarcascade_frontalface_default.xml"
 HAAR_URL = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
@@ -135,7 +136,6 @@ HAAR_URL = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcasc
 if not os.path.exists(HAAR_XML):
     print("[HAAR] Mengunduh file haarcascade_frontalface_default.xml lokal...")
     try:
-        import urllib.request
         urllib.request.urlretrieve(HAAR_URL, HAAR_XML)
     except Exception as e:
         print(f"[HAAR ERROR] Gagal mengunduh XML: {e}")
@@ -143,19 +143,14 @@ if not os.path.exists(HAAR_XML):
 face_cascade = cv2.CascadeClassifier(HAAR_XML)
 
 def dapatkan_wajah_terbesar(frame_bgr):
-    """
-    Mendeteksi wajah menggunakan Haar Cascade lokal yang ringan dan stabil di Raspi 3B+.
-    Melakukan downscaling frame untuk pemrosesan cepat (anti lag).
-    """
     if frame_bgr is None or face_cascade.empty():
         return None
 
     h_orig, w_orig = frame_bgr.shape[:2]
-    
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     small_gray = cv2.resize(gray, (320, 240))
     
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
     small_gray = clahe.apply(small_gray)
 
     faces_haar = face_cascade.detectMultiScale(
@@ -540,7 +535,6 @@ class App(tk.Tk):
     def update_su_camera(self):
         if self.cam is None: return
         
-        # Penanganan Cooldown / Lock
         if self.cooldown_start_time is not None:
             sisa_jeda = 7.0 - (time.time() - self.cooldown_start_time)
             if sisa_jeda > 0:
@@ -564,16 +558,13 @@ class App(tk.Tk):
             self.last_frame_bgr = frame.copy()
             display = frame.copy()
             
-            # Cari wajah
             wajah = dapatkan_wajah_terbesar(frame)
             
-            # GAMBAR KOTAK HIJAU REAL-TIME (Selalu digambar selama wajah ada)
             if wajah is not None:
                 (x, y, w, h) = wajah
                 cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 cv2.putText(display, "Wajah Terdeteksi", (x, max(y - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 
-                # Triggers proses keamanan jika belum berjalan
                 if not self.su_processing:
                     self.su_processing = True
                     threading.Thread(target=self.alur_keamanan_sekuensial, daemon=True).start()
@@ -724,7 +715,7 @@ class App(tk.Tk):
 
         if user == ADMIN_USERNAME_DEFAULT and pwd == ADMIN_PASSWORD_DEFAULT:
             bunyi_buzzer_sync(2)
-            messagebox.showinfo("Login Berhasil", "Akses Admin Diterima! Silahkan Daftarkan Wajah Baru.")
+            messagebox.showinfo("Login Berhasil", "Akses Admin Diterima! Silahkan Kelola atau Daftarkan Wajah Baru.")
             self.build_daftar_wajah()
         else:
             bunyi_buzzer_sync(3)
@@ -732,7 +723,7 @@ class App(tk.Tk):
             lcd_cetak("LOGIN ADMIN GAGAL", "Username / Password", "Salah!", "Coba Lagi...")
 
     # ============================================================
-    # 3. HALAMAN REGISTRASI DATASET WAJAH BARU
+    # 3. HALAMAN REGISTRASI & KELOLA USER BARU
     # ============================================================
     def build_daftar_wajah(self):
         self.clear_window()
@@ -761,13 +752,17 @@ class App(tk.Tk):
         self.dw_entry_password = tk.Entry(form_frame, font=("Segoe UI", 12), width=22, show="*")
         self.dw_entry_password.grid(row=1, column=1, padx=5, pady=5)
 
-        self.dw_btn_mulai = tk.Button(form_frame, text="Mulai Daftar", font=("Segoe UI", 11), bg=COLOR_ACCENT, fg="white", relief="flat", command=self.dw_mulai)
-        self.dw_btn_mulai.grid(row=0, column=2, rowspan=2, padx=15)
+        self.dw_btn_mulai = tk.Button(form_frame, text="Mulai Daftar", font=("Segoe UI", 11, "bold"), bg=COLOR_ACCENT, fg="white", relief="flat", command=self.dw_mulai)
+        self.dw_btn_mulai.grid(row=0, column=2, rowspan=2, padx=10)
+
+        # FITUR BARU: TOMBOL KELOLA USER TERDAFTAR
+        self.btn_kelola_user = tk.Button(form_frame, text="📋 Kelola User", font=("Segoe UI", 11, "bold"), bg="#f59f00", fg="white", relief="flat", command=self.buka_kelola_user)
+        self.btn_kelola_user.grid(row=0, column=3, rowspan=2, padx=5)
 
         self.dw_video_label = tk.Label(self, bg="black", width=VIDEO_DISPLAY_SIZE[0], height=VIDEO_DISPLAY_SIZE[1])
         self.dw_video_label.pack(pady=5)
 
-        self.dw_status_var = tk.StringVar(value="Isi data form di atas untuk memulai.")
+        self.dw_status_var = tk.StringVar(value="Isi data form di atas untuk memulai atau klik 'Kelola User'.")
         tk.Label(self, textvariable=self.dw_status_var, font=("Segoe UI", 12), bg=COLOR_BG, fg=COLOR_TEXT, wraplength=700, justify="center").pack(pady=10)
 
         btn_frame = tk.Frame(self, bg=COLOR_BG)
@@ -777,6 +772,104 @@ class App(tk.Tk):
 
         self.start_camera()
         self.update_dw_camera()
+
+    # ============================================================
+    # JENDELA POP-UP: KELOLA & HAPUS USER TERDAFTAR
+    # ============================================================
+    def buka_kelola_user(self):
+        popup = tk.Toplevel(self)
+        popup.title("Daftar User Terdaftar")
+        popup.geometry("450x400")
+        popup.resizable(False, False)
+        popup.configure(bg=COLOR_BG)
+        popup.transient(self)
+        popup.grab_set()
+
+        tk.Label(popup, text="DAFTAR USER TERDAFTAR", font=("Segoe UI", 14, "bold"), bg=COLOR_BG, fg=COLOR_TEXT).pack(pady=15)
+
+        # Listbox untuk menampilkan user
+        frame_list = tk.Frame(popup, bg=COLOR_BG)
+        frame_list.pack(pady=5, fill="both", expand=True, padx=20)
+
+        scrollbar = tk.Scrollbar(frame_list)
+        scrollbar.pack(side="right", fill="y")
+
+        listbox_user = tk.Listbox(frame_list, font=("Segoe UI", 11), yscrollcommand=scrollbar.set, bg="#2b2b3d", fg=COLOR_TEXT, selectbackground=COLOR_ACCENT, selectforeground="white", highlightthickness=0)
+        listbox_user.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=listbox_user.yview)
+
+        def muat_daftar_user():
+            listbox_user.delete(0, tk.END)
+            users = load_users()
+            
+            # Gabungkan user dari users.json dan folder dataset
+            daftar_nama = set(users.keys())
+            if os.path.exists(DATASET_DIR):
+                for folder in os.listdir(DATASET_DIR):
+                    if os.path.isdir(os.path.join(DATASET_DIR, folder)):
+                        daftar_nama.add(folder)
+
+            if not daftar_nama:
+                listbox_user.insert(tk.END, " (Belum ada user terdaftar) ")
+                listbox_user.config(state="disabled")
+            else:
+                listbox_user.config(state="normal")
+                for idx, nama in enumerate(sorted(daftar_nama), 1):
+                    # Hitung jumlah sampel foto
+                    path_folder = os.path.join(DATASET_DIR, nama)
+                    jml_foto = len([f for f in os.listdir(path_folder) if f.lower().endswith((".jpg", ".png"))]) if os.path.exists(path_folder) else 0
+                    listbox_user.insert(tk.END, f"{idx}. {nama}  ({jml_foto} Sampel Foto)")
+
+        def hapus_user_terpilih():
+            terpilih = listbox_user.curselection()
+            if not terpilih:
+                messagebox.showwarning("Peringatan", "Pilih nama user yang ingin dihapus terlebih dahulu!", parent=popup)
+                return
+
+            teks_item = listbox_user.get(terpilih[0])
+            if "Belum ada user" in teks_item: return
+
+            # Ambil nama user
+            nama_target = teks_item.split(". ")[1].split("  (")[0].strip()
+
+            konfirmasi = messagebox.askyesno(
+                "Konfirmasi Hapus", 
+                f"Apakah Anda yakin ingin menghapus user '{nama_target}'?\nSemua foto dataset dan password user ini akan dihapus permanen!", 
+                parent=popup
+            )
+
+            if konfirmasi:
+                # 1. Hapus folder dataset
+                path_folder = os.path.join(DATASET_DIR, nama_target)
+                if os.path.exists(path_folder):
+                    shutil.rmtree(path_folder)
+
+                # 2. Hapus dari users.json
+                users = load_users()
+                if nama_target in users:
+                    del users[nama_target]
+                    save_users(users)
+
+                # 3. Melatih ulang model LBPH dengan sisa dataset yang ada
+                self.su_recognizer, self.su_label_map = train_model()
+
+                bunyi_buzzer_sync(2)
+                messagebox.showinfo("Sukses", f"User '{nama_target}' berhasil dihapus dan model keamanan telah diperbarui!", parent=popup)
+                
+                # Refresh listbox
+                muat_daftar_user()
+                
+                # Perbarui status di layar utama registrasi
+                self.dw_status_var.set(f"User '{nama_target}' terhapus. Model otomatis dilatih ulang.")
+                lcd_cetak("USER TERHAPUS", f"User: {nama_target}", "Model Keamanan", "Di-update Otomatis!")
+
+        muat_daftar_user()
+
+        btn_frame_popup = tk.Frame(popup, bg=COLOR_BG)
+        btn_frame_popup.pack(pady=15)
+
+        tk.Button(btn_frame_popup, text="🗑️ Hapus User Selected", font=("Segoe UI", 11, "bold"), bg=COLOR_DANGER, fg="white", relief="flat", padx=10, pady=5, command=hapus_user_terpilih).pack(side="left", padx=10)
+        tk.Button(btn_frame_popup, text="Tutup", font=("Segoe UI", 11), bg="#5c5f66", fg="white", relief="flat", padx=15, pady=5, command=popup.destroy).pack(side="left", padx=10)
 
     def update_dw_camera(self):
         if self.cam is None: return
@@ -819,6 +912,7 @@ class App(tk.Tk):
         self.dw_entry_nama.config(state="disabled")
         self.dw_entry_password.config(state="disabled")
         self.dw_btn_mulai.config(state="disabled")
+        self.btn_kelola_user.config(state="disabled")
         self.dw_btn_ambil.config(state="normal", text=f"Ambil Foto Sample (0/{MIN_SAMPLES})")
         
         msg = f"Wajah siap dipindai. Kumpulkan {MIN_SAMPLES} sampel (Lurus, Kiri, Kanan)."
@@ -863,7 +957,11 @@ class App(tk.Tk):
 
         if self.dw_sample_count >= MIN_SAMPLES:
             self.dw_btn_ambil.config(state="disabled")
-            messagebox.showinfo("Sukses", f"Registrasi wajah '{self.dw_nama}' selesai!")
+            
+            # Melatih ulang model LBPH dengan sampel user baru
+            self.su_recognizer, self.su_label_map = train_model()
+            
+            messagebox.showinfo("Sukses", f"Registrasi wajah '{self.dw_nama}' selesai! Model telah diperbarui.")
             self.build_sistem_utama()
 
 if __name__ == "__main__":
