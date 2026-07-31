@@ -3,10 +3,11 @@ SISTEM KEAMANAN PINTU: WAJAH (OPENCV DNN) + SUARA
 ===================================================================
 1. Buka Pintu dengan Wajah -> Terdeteksi -> Solenoid Aktif (Pintu Terbuka)
 2. Jika Wajah Tidak Terdeteksi / Asing -> Verifikasi Password Suara (Mic)
+   - Cross-check Wajah & Password (mencegah orang lain pakai password user lain)
    - Password Suara Benar -> Solenoid Aktif (Pintu Terbuka)
    - Password Suara Salah -> Electric Discharge 6s + Kirim Notifikasi WA
 3. Pilihan ID Mic Dinamis + Auto-Detect Wireless Mic + Visualisator Spektrum
-4. Fitur Kelola & Hapus User Terdaftar (Admin Mode) - FIXED BUTTON & POPUP
+4. Fitur Kelola & Hapus User Terdaftar (Admin Mode)
 """
 
 import os
@@ -88,7 +89,7 @@ DATASET_DIR = "dataset"
 USERS_FILE = "users.json"
 MIN_SAMPLES = 9 
 FACE_SIZE = (200, 200) 
-LBPH_THRESHOLD = 52  # Threshold ideal menolak orang asing dan akurat di berbagai cahaya
+LBPH_THRESHOLD = 52 
 
 VIDEO_DISPLAY_SIZE = (480, 270) 
 
@@ -126,9 +127,6 @@ def normalisasi_cahaya(gray_crop):
     clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
     return clahe.apply(gray_crop)
 
-# ============================================================
-# DETEKTOR WAJAH HAAR CASCADE LOKAL
-# ============================================================
 HAAR_XML = "haarcascade_frontalface_default.xml"
 HAAR_URL = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
 
@@ -574,97 +572,128 @@ class App(tk.Tk):
         self.camera_after_id = self.after(40, self.update_su_camera)
 
     def alur_keamanan_sekuensial(self):
-        bunyi_buzzer_sync(1)
-        
-        for i in range(3, 0, -1):
-            self.su_set_status_threadsafe(f"Wajah terdeteksi! Memindai dalam {i} detik...")
-            lcd_cetak("WAJAH TERDETEKSI!", "Mohon Paskan Wajah", f"Proses Scan: {i} s", "Jangan Bergerak!")
-            time.sleep(1.0)
+        try:
+            bunyi_buzzer_sync(1)
             
-        if self.su_recognizer is None or self.last_frame_bgr is None:
-            self.su_processing = False
-            return
-
-        self.su_set_status_threadsafe("Memindai dan mencocokkan wajah...")
-        lcd_cetak("=== SCANNING ===", "Mencocokkan Data", "Harap Tunggu...", "")
-        
-        wajah = dapatkan_wajah_terbesar(self.last_frame_bgr)
-        wajah_terverifikasi = False
-        nama_user = "Orang Asing"
-
-        if wajah is not None:
-            (x, y, w, h) = wajah
-            gray_frame = cv2.cvtColor(self.last_frame_bgr, cv2.COLOR_BGR2GRAY)
-            face_crop = gray_frame[y:y + h, x:x + w]
-            
-            if face_crop.size > 0:
-                face_img = cv2.resize(face_crop, FACE_SIZE)
-                face_img = normalisasi_cahaya(face_img)
+            for i in range(3, 0, -1):
+                self.su_set_status_threadsafe(f"Wajah terdeteksi! Memindai dalam {i} detik...")
+                lcd_cetak("WAJAH TERDETEKSI!", "Mohon Paskan Wajah", f"Proses Scan: {i} s", "Jangan Bergerak!")
+                time.sleep(1.0)
                 
-                label, confidence = self.su_recognizer.predict(face_img)
+            if self.su_recognizer is None or self.last_frame_bgr is None:
+                return
+
+            self.su_set_status_threadsafe("Memindai dan mencocokkan wajah...")
+            lcd_cetak("=== SCANNING ===", "Mencocokkan Data", "Harap Tunggu...", "")
+            
+            wajah = dapatkan_wajah_terbesar(self.last_frame_bgr)
+            wajah_terverifikasi = False
+            nama_user = "Orang Asing"
+
+            if wajah is not None:
+                (x, y, w, h) = wajah
+                gray_frame = cv2.cvtColor(self.last_frame_bgr, cv2.COLOR_BGR2GRAY)
+                face_crop = gray_frame[y:y + h, x:x + w]
+                
+                if face_crop.size > 0:
+                    face_img = cv2.resize(face_crop, FACE_SIZE)
+                    face_img = normalisasi_cahaya(face_img)
+                    
+                    label, confidence = self.su_recognizer.predict(face_img)
+                    cv2.imwrite("pintu_log.jpg", self.last_frame_bgr)
+
+                    if confidence < LBPH_THRESHOLD:
+                        wajah_terverifikasi = True
+                        nama_user = self.su_label_map.get(label, "User")
+
+            # -----------------------------------------------------------------
+            # TAHAP 1: WAJAH TERDETEKSI -> BUKA PINTU
+            # -----------------------------------------------------------------
+            if wajah_terverifikasi:
+                self.su_set_status_threadsafe(f"WAJAH TERDETEKSI: Welcome {nama_user}!\nSELAMAT, SILAHKAN MASUK!")
+                lcd_cetak("=== AKSES DITERIMA ===", f"Halo, {nama_user}", "SILAHKAN MASUK", "PINTU TERBUKA")
+                
+                bunyi_buzzer_sync(2)
+                _relay_set(RELAY_SOLENOID_PIN, True)
+                time.sleep(DURASI_SOLENOID_DETIK)
+                _relay_set(RELAY_SOLENOID_PIN, False)
+                return
+
+            # -----------------------------------------------------------------
+            # TAHAP 2: VERIFIKASI SUARA (VERIFIKASI SILANG WAJAH & PASSWORD)
+            # -----------------------------------------------------------------
+            bunyi_buzzer_sync(2)
+            
+            self.su_set_status_threadsafe("Wajah belum terverifikasi!\nMembuka mikrofon, silahkan ucapkan password suara anda...")
+            lcd_cetak("VERIFIKASI SUARA", "Gunakan Password", "Silahkan Ucapkan", "Password Suara!")
+            
+            spoken_text = speech_to_text(
+                device_id=self.selected_mic_id,
+                status_callback=self.su_set_status_threadsafe,
+                wave_callback=self.update_spectrum_threadsafe
+            )
+            
+            password_benar = False
+            pemilik_password = None
+            users = load_users()
+
+            if spoken_text is not None:
+                input_hash = hash_password(spoken_text)
+                for u_name, u_data in users.items():
+                    if u_data.get("password") == input_hash:
+                        pemilik_password = u_name
+                        break
+
+            # Verifikasi Silang: Pastikan wajah di depan kamera sama dengan pemilik password
+            if pemilik_password is not None and wajah is not None:
+                (x, y, w, h) = wajah
+                gray_frame = cv2.cvtColor(self.last_frame_bgr, cv2.COLOR_BGR2GRAY)
+                face_crop = gray_frame[y:y + h, x:x + w]
+                
+                if face_crop.size > 0:
+                    face_img = cv2.resize(face_crop, FACE_SIZE)
+                    face_img = normalisasi_cahaya(face_img)
+                    
+                    label_prediksi, confidence = self.su_recognizer.predict(face_img)
+                    nama_prediksi = self.su_label_map.get(label_prediksi, "")
+
+                    if nama_prediksi == pemilik_password:
+                        password_benar = True
+                        nama_user = pemilik_password
+
+            if password_benar:
+                self.su_set_status_threadsafe(f'Suara: "{spoken_text}"\nPASSWORD & WAJAH COCOK ({nama_user})! SILAHKAN MASUK!')
+                lcd_cetak("=== AKSES DITERIMA ===", f"User: {nama_user}", "PASSWORD & WAJAH OK", "PINTU TERBUKA")
+                
+                bunyi_buzzer_sync(2)
+                _relay_set(RELAY_SOLENOID_PIN, True)
+                time.sleep(DURASI_SOLENOID_DETIK)
+                _relay_set(RELAY_SOLENOID_PIN, False)
+
+            else:
+                bunyi_buzzer_sync(3)
+                teks_log = spoken_text if spoken_text else "Suara Tidak Terdeteksi / Kosong"
+                
+                if pemilik_password and not password_benar:
+                    status_msg = f"PASSWORD NAMA LAIN ('{pemilik_password}') Ditolak!"
+                else:
+                    status_msg = f"PASSWORD SALAH: '{teks_log}'"
+
+                self.su_set_status_threadsafe(f"{status_msg}\nELECTRIC DISCHARGE AKTIF (6s)!")
+                lcd_cetak("=== AKSES DITOLAK ===", "AKSES ILEGAL!", "DISCHARGE AKTIF!", "KIRIM NOTIF WA...")
+                
                 cv2.imwrite("pintu_log.jpg", self.last_frame_bgr)
+                self.kirim_shiftwa_async("Orang Asing", status_msg)
+                
+                _relay_set(RELAY_DISCHARGE_PIN, True)
+                time.sleep(DURASI_DISCHARGE_DETIK)
+                _relay_set(RELAY_DISCHARGE_PIN, False)
 
-                if confidence < LBPH_THRESHOLD:
-                    wajah_terverifikasi = True
-                    nama_user = self.su_label_map.get(label, "User")
+        except Exception as e:
+            print(f"[ALUR ERROR] Terjadi kesalahan dalam proses: {e}")
 
-        if wajah_terverifikasi:
-            self.su_set_status_threadsafe(f"WAJAH TERDETEKSI: Welcome {nama_user}!\nSELAMAT, SILAHKAN MASUK!")
-            lcd_cetak("=== AKSES DITERIMA ===", f"Halo, {nama_user}", "SILAHKAN MASUK", "PINTU TERBUKA")
-            
-            bunyi_buzzer_sync(2)
-            _relay_set(RELAY_SOLENOID_PIN, True)
-            time.sleep(DURASI_SOLENOID_DETIK)
-            _relay_set(RELAY_SOLENOID_PIN, False)
-            
+        finally:
             self.cooldown_start_time = time.time()
-            return
-
-        bunyi_buzzer_sync(2)
-        self.su_set_status_threadsafe("Wajah tidak dikenal / tidak terdeteksi!\nMembuka mikrofon, silahkan ucapkan password suara...")
-        lcd_cetak("WAJAH TIDAK DIKENAL", "Gunakan Password", "Silahkan Ucapkan", "Password Suara!")
-        
-        spoken_text = speech_to_text(
-            device_id=self.selected_mic_id,
-            status_callback=self.su_set_status_threadsafe,
-            wave_callback=self.update_spectrum_threadsafe
-        )
-        
-        password_benar = False
-        users = load_users()
-
-        if spoken_text is not None:
-            input_hash = hash_password(spoken_text)
-            for u_name, u_data in users.items():
-                if u_data.get("password") == input_hash:
-                    password_benar = True
-                    nama_user = u_name
-                    break
-
-        if password_benar:
-            self.su_set_status_threadsafe(f'Suara: "{spoken_text}"\nPASSWORD BENAR (User: {nama_user})! SILAHKAN MASUK!')
-            lcd_cetak("=== AKSES DITERIMA ===", f"User: {nama_user}", "PASSWORD BENAR", "PINTU TERBUKA")
-            
-            bunyi_buzzer_sync(2)
-            _relay_set(RELAY_SOLENOID_PIN, True)
-            time.sleep(DURASI_SOLENOID_DETIK)
-            _relay_set(RELAY_SOLENOID_PIN, False)
-
-        else:
-            bunyi_buzzer_sync(3)
-            
-            teks_log = spoken_text if spoken_text else "Suara Tidak Terdeteksi / Kosong"
-            self.su_set_status_threadsafe(f'Suara: "{teks_log}"\nPASSWORD SALAH! ELECTRIC DISCHARGE AKTIF (6s)!')
-            lcd_cetak("=== AKSES DITOLAK ===", "PASSWORD SALAH!", "DISCHARGE AKTIF!", "KIRIM NOTIF WA...")
-            
-            cv2.imwrite("pintu_log.jpg", self.last_frame_bgr)
-            self.kirim_shiftwa_async(nama_user, f"AKSES DITOLAK (Password Salah: '{teks_log}')")
-            
-            _relay_set(RELAY_DISCHARGE_PIN, True)
-            time.sleep(DURASI_DISCHARGE_DETIK)
-            _relay_set(RELAY_DISCHARGE_PIN, False)
-
-        self.cooldown_start_time = time.time()
 
     def su_set_status_threadsafe(self, msg):
         self.after(0, lambda: self.su_status_var.set(msg))
@@ -747,7 +776,6 @@ class App(tk.Tk):
         self.dw_btn_mulai = tk.Button(form_frame, text="Mulai Daftar", font=("Segoe UI", 11, "bold"), bg=COLOR_ACCENT, fg="white", relief="flat", command=self.dw_mulai)
         self.dw_btn_mulai.grid(row=0, column=2, rowspan=2, padx=10)
 
-        # TOMBOL KELOLA USER (SELALU AKTIF)
         self.btn_kelola_user = tk.Button(form_frame, text="📋 Kelola User", font=("Segoe UI", 11, "bold"), bg="#f59f00", fg="white", relief="flat", command=self.buka_kelola_user)
         self.btn_kelola_user.grid(row=0, column=3, rowspan=2, padx=5)
 
@@ -765,9 +793,6 @@ class App(tk.Tk):
         self.start_camera()
         self.update_dw_camera()
 
-    # ============================================================
-    # POP-UP KELOLA & HAPUS USER TERDAFTAR (REVISI PERBAIKAN)
-    # ============================================================
     def buka_kelola_user(self):
         try:
             popup = tk.Toplevel(self)
@@ -835,22 +860,19 @@ class App(tk.Tk):
                 )
 
                 if konfirmasi:
-                    # 1. Hapus folder dataset
                     path_folder = os.path.join(DATASET_DIR, nama_target)
                     if os.path.exists(path_folder):
                         shutil.rmtree(path_folder)
 
-                    # 2. Hapus dari users.json
                     users = load_users()
                     if nama_target in users:
                         del users[nama_target]
                         save_users(users)
 
-                    # 3. Retrain model LBPH
                     self.su_recognizer, self.su_label_map = train_model()
 
                     bunyi_buzzer_sync(2)
-                    messagebox.showinfo("Sukses", f"User '{nama_target}' berhasil dihapus dan model keamanan telah diperbarui!", parent=popup)
+                    messagebox.showinfo("Sukses", f"User '{nama_target}' berhasil dihapus dan model telah diperbarui!", parent=popup)
                     
                     muat_daftar_user()
                     self.dw_status_var.set(f"User '{nama_target}' terhapus. Model otomatis dilatih ulang.")
@@ -908,7 +930,6 @@ class App(tk.Tk):
         self.dw_entry_nama.config(state="disabled")
         self.dw_entry_password.config(state="disabled")
         self.dw_btn_mulai.config(state="disabled")
-        # TETAP PERTAHANKAN BUTTON KELOLA USER AKTIF (STATE = NORMAL)
         self.btn_kelola_user.config(state="normal")
         self.dw_btn_ambil.config(state="normal", text=f"Ambil Foto Sample (0/{MIN_SAMPLES})")
         
@@ -955,7 +976,6 @@ class App(tk.Tk):
         if self.dw_sample_count >= MIN_SAMPLES:
             self.dw_btn_ambil.config(state="disabled")
             
-            # Melatih ulang model LBPH dengan sampel user baru
             self.su_recognizer, self.su_label_map = train_model()
             
             messagebox.showinfo("Sukses", f"Registrasi wajah '{self.dw_nama}' selesai! Model telah diperbarui.")
