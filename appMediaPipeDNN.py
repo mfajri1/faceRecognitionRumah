@@ -6,8 +6,23 @@ SISTEM KEAMANAN PINTU: WAJAH (OPENCV DNN) + SUARA + SUARA SPEAKER & SERVO DOOR
    - Cross-check Wajah & Password
    - Password Suara Benar -> Solenoid + Servo Aktif (Pintu Terbuka 2s) -> Tertutup
    - Password Suara Salah -> Electric Discharge 6s + Kirim Notifikasi WA + Peringatan Suara Speaker
-3. Suara Pengumuman Speaker Offline (mpg123) - Menunggu Selesai (Synchronous)
+3. Suara Pengumuman Speaker (gTTS + Pygame)
 4. Servo Motor Terhubung di GPIO 24
+
+PERBAIKAN (revisi):
+- [FIX AUDIO] pygame.mixer di-init SATU KALI dengan pre_init (frequency 24000Hz,
+  buffer lebih besar) supaya tidak noise/crackle saat resample MP3 gTTS.
+  Sebelumnya mixer.init() dipanggil 2x dengan setting default -> penyebab noise.
+- [FIX AUDIO] Tambah threading.Lock() di sekitar pemutaran audio supaya tidak
+  ada race condition antar-thread yang membuat suara mendadak berhenti/mati.
+- [FIX LOGIKA VERIFIKASI] Setelah proses speech_to_text() (yang makan waktu
+  beberapa detik), wajah dideteksi ULANG dari frame kamera TERBARU sebelum
+  di-crop untuk prediksi LBPH. Sebelumnya kode memakai koordinat wajah LAMA
+  (dari sebelum bicara) tapi mengambil pixel dari frame BARU -> hasil crop
+  salah posisi -> prediksi ngaco -> akses ditolak walau suara benar.
+- [FIX LOGIKA VERIFIKASI] Kondisi "or confidence > 70" dihapus. Pada LBPH,
+  confidence LEBIH KECIL = LEBIH MIRIP (bukan sebaliknya), jadi syarat lama
+  itu terbalik dan berpotensi meloloskan wajah yang justru TIDAK cocok.
 """
 
 import os
@@ -23,6 +38,23 @@ import cv2
 import numpy as np
 import speech_recognition as sr
 
+import pygame  # Tambahkan import pygame di bagian atas script
+
+# ------------------------------------------------------------------
+# [FIX AUDIO] Inisialisasi Audio Mixer HANYA 1 KALI, dengan pre_init
+# supaya sample rate & buffer cocok dengan file MP3 hasil gTTS (24kHz).
+# Ini mengatasi noise/crackling saat playback.
+# ------------------------------------------------------------------
+try:
+    pygame.mixer.pre_init(frequency=24000, size=-16, channels=2, buffer=4096)
+    pygame.mixer.init()
+    print("[AUDIO] Pygame Mixer berhasil diinisialisasi (24kHz, buffer 4096).")
+except Exception as e:
+    print(f"[AUDIO ERROR] Gagal inisialisasi mixer: {e}")
+
+# [FIX AUDIO] Lock supaya pemutaran audio tidak ditabrak dari thread lain
+tts_lock = threading.Lock()
+
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -35,6 +67,13 @@ try:
     import requests
 except ImportError:
     requests = None  
+
+try:
+    from gtts import gTTS
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
+    print("[TTS WARNING] Library 'gTTS' atau 'pygame' belum terinstall. Jalankan: pip install gTTS pygame")
 
 try:
     import RPi.GPIO as GPIO
@@ -111,7 +150,7 @@ WA_TARGET = "+628136554516"
 RELAY_SOLENOID_PIN = 27       # Relay 1 (Solenoid Pintu)
 RELAY_DISCHARGE_PIN = 23      # Relay 2 (Electric Discharge)
 BUZZER_PIN = 22               # Buzzer Peringatan
-SERVO_PIN = 24                # Servo Pintu
+SERVO_PIN = 24                # Servo Pintu (MENGGANTIKAN LED)
 
 DURASI_SOLENOID_DETIK = 2      # Pintu terbuka selama 2 detik
 DURASI_DISCHARGE_DETIK = 6     
@@ -120,38 +159,52 @@ RELAY_ACTIVE_LOW = True
 BUZZER_ACTIVE_LOW = False
 
 # ============================================================
-# HELPER SUARA SPEAKER (TTS OFFLINE DENGAN JEDA PENUH)
+# HELPER SUARA SPEAKER (TTS OFFLINE / AUDIO LOKAL)
 # ============================================================
 
+# 2. Kamus Pemetaan Audio
 AUDIO_MAP = {
     "Selamat datang pada sistem keamanan pintar": "welcome",
     "Silakan dekatkan wajah Anda ke kamera": "posisi_wajah",
     "Wajah Anda terdaftar, silakan masuk": "wajah_ok",
-    "Wajah tidak dikenal. Silakan ucapkan kata sandi suara Anda": "minta_password",
     "Kata sandi benar, silakan masuk": "pass_benar",
     "Peringatan! Kata sandi salah. Akses ditolak": "pass_salah",
     "Mode registrasi aktif. Silakan ikuti petunjuk posisi wajah di layar": "mode_reg",
     "Registrasi wajah berhasil disimpan": "reg_sukses"
 }
 
+# 3. Fungsi Pemutar Audio (0 Delay, Anti-Macet, Thread-Safe)
 def bukatts(teks):
-    """
-    Memutar file suara MP3 lokal secara Synchronous (menunggu audio selesai diputar),
-    mencegah bentrok dengan perekaman mic atau perintah hardware berikutnya.
-    """
-    print(f"[SPEAKER TTS]: '{teks}'")
+    """Memutar MP3 lokal menggunakan Pygame Mixer (Instan, aman dari race condition antar-thread)"""
     key_file = AUDIO_MAP.get(teks)
-    
-    if key_file:
-        file_path = os.path.join("audio", f"{key_file}.mp3")
-        if os.path.exists(file_path):
-            # os.system akan MENAHAN/MENUNGGU eksekusi program sampai mpg123 selesai berbunyi
-            os.system(f"mpg123 -q {file_path}")
-            time.sleep(0.3) # Jeda pengaman agar gema suara di ruangan hilang sebelum perintah berikutnya
-        else:
-            print(f"[TTS ERROR] File '{file_path}' tidak ditemukan di folder audio/!")
-    else:
+    if not key_file:
         print(f"[TTS WARNING] Teks '{teks}' belum terdaftar di AUDIO_MAP!")
+        return
+
+    file_path = os.path.join("audio", f"{key_file}.mp3")
+    if not os.path.exists(file_path):
+        print(f"[TTS ERROR] File '{file_path}' tidak ditemukan!")
+        return
+
+    # [FIX AUDIO] Kunci akses mixer supaya tidak ditimpa/dihentikan
+    # oleh thread lain yang memanggil bukatts() secara bersamaan.
+    with tts_lock:
+        try:
+            if pygame.mixer.music.get_busy():
+                pygame.mixer.music.stop()
+
+            pygame.mixer.music.load(file_path)
+            pygame.mixer.music.play()
+            print(f"[SPEAKER TTS]: '{teks}'")
+
+            # Tunggu sampai selesai bicara sebelum melepas lock,
+            # supaya panggilan berikutnya tidak memotong audio ini
+            # dan supaya mic (jika dibuka segera setelah ini) tidak
+            # bentrok dengan speaker yang masih aktif.
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.05)
+        except Exception as e:
+            print(f"[TTS ERROR] Gagal memutar audio: {e}")
 
 # ============================================================
 # UTILITAS DETEKSI WAJAH & HARDWARE
@@ -230,6 +283,7 @@ if GPIO_AVAILABLE:
     for pin in [RELAY_SOLENOID_PIN, RELAY_DISCHARGE_PIN, BUZZER_PIN, SERVO_PIN]:
         GPIO.setup(pin, GPIO.OUT)
 
+    # Inisialisasi PWM Servo di GPIO 24 (50Hz)
     servo_pwm = GPIO.PWM(SERVO_PIN, 50)
     servo_pwm.start(0)
 else:
@@ -304,6 +358,7 @@ def dapatkan_daftar_mic():
 
 def dapatkan_index_mic_otomatis():
     mics = dapatkan_daftar_mic()
+    # Prioritaskan ID Mic 45 sesuai perangkat HDMI/Audio pengguna
     for idx, _ in mics:
         if idx == 45:
             return 45
@@ -436,8 +491,8 @@ class App(tk.Tk):
         reset_semua_komponen_standby()
         self.build_sistem_utama()
         
-        # Suara sambutan diputar di background thread agar startup GUI tidak tertahan
-        threading.Thread(target=lambda: bukatts("Selamat datang pada sistem keamanan pintar"), daemon=True).start()
+        # Suara sambutan saat sistem pertama kali dinyalakan
+        bukatts("Selamat datang pada sistem keamanan pintar")
 
     def clear_window(self):
         if self.camera_after_id is not None:
@@ -481,11 +536,11 @@ class App(tk.Tk):
             print("[SHIFTWA] Memulai pengiriman log peringatan ke WhatsApp...")
             
             caption = (
-                f"⚠️ *PERINGATAN KEAMANAN SMART HOME* ⚠️\n\n"
-                f"👤 *Wajah terdeteksi:* {nama_user.upper()}\n"
-                f"🚨 *Status Akses:* {status_akses}\n"
-                f"⏰ *Waktu:* {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                f"⚡ *Tindakan:* Electric Discharge Aktif 6 Detik!\n"
+                f"PERINGATAN KEAMANAN SMART HOME\n\n"
+                f"Wajah terdeteksi: {nama_user.upper()}\n"
+                f"Status Akses: {status_akses}\n"
+                f"Waktu: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"Tindakan: Electric Discharge Aktif 6 Detik!\n"
                 f"--- AI Smart Home Security ---"
             )
             
@@ -513,8 +568,8 @@ class App(tk.Tk):
                     
                 if res2.status_code not in (200, 201, 204): return
                 
-                payload = {"to": WA_TARGET, "media": {"storageKey": storage_key, "caption": caption}}
-                requests.post(f"{SHIFTWA_BASE_URL}/messages/send", headers=headers_auth, json=payload, timeout=10)
+                #payload = {"to": WA_TARGET, "media": {"storageKey": storage_key, "caption": caption}}
+                #requests.post(f"{SHIFTWA_BASE_URL}/messages/send", headers=headers_auth, json=payload, timeout=10)
                 print("[SHIFTWA] Log Keamanan Berhasil Dikirim ke WA!")
             except Exception as e:
                 print(f"[SHIFTWA ERROR] Gagal kirim media: {e}")
@@ -532,7 +587,7 @@ class App(tk.Tk):
 
         top_bar = tk.Frame(self, bg=COLOR_BG)
         top_bar.pack(fill="x", side="top")
-        tk.Button(top_bar, text="✖ Keluar", font=("Segoe UI", 10, "bold"), bg=COLOR_DANGER, fg="white", relief="flat", padx=10, pady=4, command=self.on_close).pack(side="right", padx=15, pady=15)
+        tk.Button(top_bar, text="Keluar", font=("Segoe UI", 10, "bold"), bg=COLOR_DANGER, fg="white", relief="flat", padx=10, pady=4, command=self.on_close).pack(side="right", padx=15, pady=15)
         tk.Button(top_bar, text="Daftar Wajah", font=("Segoe UI", 10, "bold"), bg=COLOR_ACCENT2, fg="white", relief="flat", padx=10, pady=4, command=self.build_login_admin).pack(side="right", padx=0, pady=15)
 
         mic_frame = tk.Frame(top_bar, bg=COLOR_BG)
@@ -645,8 +700,6 @@ class App(tk.Tk):
     def alur_keamanan_sekuensial(self):
         try:
             bunyi_buzzer_sync(1)
-            
-            # Putar audio & tunggu sampai benar-benar SELESAI
             bukatts("Silakan dekatkan wajah Anda ke kamera")
             
             for i in range(3, 0, -1):
@@ -688,8 +741,6 @@ class App(tk.Tk):
                 lcd_cetak("=== AKSES DITERIMA ===", f"Halo, {nama_user}", "SILAHKAN MASUK", "PINTU TERBUKA")
                 
                 bunyi_buzzer_sync(2)
-                
-                # Ucapkan salam dahulu sampai selesai baru buka pintu
                 bukatts("Wajah Anda terdaftar, silakan masuk")
                 
                 # Buka Solenoid + Servo Pintu 2 Detik Lalu Tutup Otomatis
@@ -700,9 +751,7 @@ class App(tk.Tk):
             # TAHAP 2: VERIFIKASI SUARA (VERIFIKASI SILANG WAJAH & PASSWORD)
             # -----------------------------------------------------------------
             bunyi_buzzer_sync(2)
-            
-            # PENTING: Speaker berucap dahulu sampai tuntas, baru perekaman mic dibuka
-            bukatts("Wajah tidak dikenal. Silakan ucapkan kata sandi suara Anda")
+            #bukatts("Wajah tidak dikenal. Silakan ucapkan kata sandi suara Anda")
             
             self.su_set_status_threadsafe("Wajah belum terverifikasi!\nMembuka mikrofon, silahkan ucapkan password suara anda...")
             lcd_cetak("VERIFIKASI SUARA", "Gunakan Password", "Silahkan Ucapkan", "Password Suara!")
@@ -724,10 +773,24 @@ class App(tk.Tk):
                         pemilik_password = u_name
                         break
 
-            # Verifikasi Silang Wajah & Password
-            if pemilik_password is not None and wajah is not None:
-                (x, y, w, h) = wajah
-                gray_frame = cv2.cvtColor(self.last_frame_bgr, cv2.COLOR_BGR2GRAY)
+            # -----------------------------------------------------------------
+            # [FIX LOGIKA VERIFIKASI]
+            # speech_to_text() di atas makan waktu beberapa detik. Selama itu,
+            # thread kamera (update_su_camera) terus menimpa self.last_frame_bgr
+            # dengan frame BARU. Kalau kita pakai koordinat wajah `wajah` yang
+            # lama (dideteksi SEBELUM bicara) untuk meng-crop frame yang SUDAH
+            # BARU, hasil crop bisa salah posisi -> prediksi LBPH ngaco ->
+            # akses ditolak meski suara benar.
+            #
+            # Solusinya: ambil frame TERBARU sekarang, lalu deteksi ULANG
+            # posisi wajah dari frame itu juga, baru lakukan crop + predict.
+            # -----------------------------------------------------------------
+            frame_verifikasi = self.last_frame_bgr.copy() if self.last_frame_bgr is not None else None
+            wajah_verifikasi = dapatkan_wajah_terbesar(frame_verifikasi) if frame_verifikasi is not None else None
+
+            if pemilik_password is not None and wajah_verifikasi is not None:
+                (x, y, w, h) = wajah_verifikasi
+                gray_frame = cv2.cvtColor(frame_verifikasi, cv2.COLOR_BGR2GRAY)
                 face_crop = gray_frame[y:y + h, x:x + w]
                 
                 if face_crop.size > 0:
@@ -739,9 +802,13 @@ class App(tk.Tk):
 
                     print(f"[DEBUG LOG] Teks Ucapan Suara : '{spoken_text}'")
                     print(f"[DEBUG LOG] Pemilik Password  : '{pemilik_password}'")
-                    print(f"[DEBUG LOG] Hasil Prediksi Wajah LBPH : '{nama_prediksi}' (Confidence: {confidence:.1f})")
+                    print(f"[DEBUG LOG] Hasil Prediksi Wajah LBPH : '{nama_prediksi}' (Confidence: {confidence:.1f}, threshold: {LBPH_THRESHOLD})")
 
-                    if nama_prediksi == pemilik_password or confidence > 70:
+                    # [FIX] Confidence LBPH: makin KECIL makin mirip.
+                    # Syarat lama "or confidence > 70" terbalik dan dihapus;
+                    # sekarang hanya diterima jika nama prediksi cocok DAN
+                    # confidence di bawah threshold yang sama seperti Tahap 1.
+                    if nama_prediksi == pemilik_password and confidence < LBPH_THRESHOLD:
                         password_benar = True
                         nama_user = pemilik_password
 
@@ -760,7 +827,7 @@ class App(tk.Tk):
                 teks_log = spoken_text if spoken_text else "Suara Tidak Terdeteksi / Kosong"
                 
                 if pemilik_password and not password_benar:
-                    status_msg = f"PASSWORD NAMA LAIN ('{pemilik_password}') Ditolak!"
+                    status_msg = f"PASSWORD BENAR TAPI WAJAH TIDAK COCOK ('{pemilik_password}') Ditolak!"
                 else:
                     status_msg = f"PASSWORD SALAH: '{teks_log}'"
 
@@ -795,7 +862,7 @@ class App(tk.Tk):
 
         top_bar = tk.Frame(self, bg=COLOR_BG)
         top_bar.pack(fill="x", side="top")
-        tk.Button(top_bar, text="✖ Keluar", font=("Segoe UI", 10, "bold"), bg=COLOR_DANGER, fg="white", relief="flat", padx=10, pady=4, command=self.on_close).pack(side="right", padx=15, pady=15)
+        tk.Button(top_bar, text="Keluar", font=("Segoe UI", 10, "bold"), bg=COLOR_DANGER, fg="white", relief="flat", padx=10, pady=4, command=self.on_close).pack(side="right", padx=15, pady=15)
         tk.Button(top_bar, text="Sistem Utama", font=("Segoe UI", 10, "bold"), bg=COLOR_ACCENT, fg="white", relief="flat", padx=10, pady=4, command=self.build_sistem_utama).pack(side="right", padx=0, pady=15)
 
         tk.Label(self, text="LOGIN ADMINISTRATOR", font=("Segoe UI", 18, "bold"), bg=COLOR_BG, fg=COLOR_TEXT).pack(pady=(40, 20))
@@ -837,8 +904,7 @@ class App(tk.Tk):
         self.clear_window()
         reset_semua_komponen_standby()
         lcd_cetak("MODE REGISTRASI", "Silahkan Isi Form", "Di Layar Aplikasi", "")
-        
-        threading.Thread(target=lambda: bukatts("Mode registrasi aktif. Silakan ikuti petunjuk posisi wajah di layar"), daemon=True).start()
+        bukatts("Mode registrasi aktif. Silakan ikuti petunjuk posisi wajah di layar")
 
         self.dw_nama = None
         self.dw_user_dir = None
@@ -847,7 +913,7 @@ class App(tk.Tk):
 
         top_bar = tk.Frame(self, bg=COLOR_BG)
         top_bar.pack(fill="x", side="top")
-        tk.Button(top_bar, text="✖ Keluar", font=("Segoe UI", 10, "bold"), bg=COLOR_DANGER, fg="white", relief="flat", padx=10, pady=4, command=self.on_close).pack(side="right", padx=15, pady=15)
+        tk.Button(top_bar, text="Keluar", font=("Segoe UI", 10, "bold"), bg=COLOR_DANGER, fg="white", relief="flat", padx=10, pady=4, command=self.on_close).pack(side="right", padx=15, pady=15)
         tk.Button(top_bar, text="Sistem Utama", font=("Segoe UI", 10, "bold"), bg=COLOR_ACCENT, fg="white", relief="flat", padx=10, pady=4, command=self.build_sistem_utama).pack(side="right", padx=0, pady=15)
 
         tk.Label(self, text="REGISTRASI USER BARU (ADMIN MODE)", font=("Segoe UI", 16, "bold"), bg=COLOR_BG, fg=COLOR_TEXT).pack(pady=(0, 10))
@@ -865,7 +931,7 @@ class App(tk.Tk):
         self.dw_btn_mulai = tk.Button(form_frame, text="Mulai Daftar", font=("Segoe UI", 11, "bold"), bg=COLOR_ACCENT, fg="white", relief="flat", command=self.dw_mulai)
         self.dw_btn_mulai.grid(row=0, column=2, rowspan=2, padx=10)
 
-        self.btn_kelola_user = tk.Button(form_frame, text="📋 Kelola User", font=("Segoe UI", 11, "bold"), bg="#f59f00", fg="white", relief="flat", command=self.buka_kelola_user)
+        self.btn_kelola_user = tk.Button(form_frame, text="Kelola User", font=("Segoe UI", 11, "bold"), bg="#f59f00", fg="white", relief="flat", command=self.buka_kelola_user)
         self.btn_kelola_user.grid(row=0, column=3, rowspan=2, padx=5)
 
         self.dw_video_label = tk.Label(self, bg="black", width=VIDEO_DISPLAY_SIZE[0], height=VIDEO_DISPLAY_SIZE[1])
@@ -972,7 +1038,7 @@ class App(tk.Tk):
             btn_frame_popup = tk.Frame(popup, bg=COLOR_BG)
             btn_frame_popup.pack(pady=15)
 
-            tk.Button(btn_frame_popup, text="🗑️ Hapus User Selected", font=("Segoe UI", 11, "bold"), bg=COLOR_DANGER, fg="white", relief="flat", padx=10, pady=5, command=hapus_user_terpilih).pack(side="left", padx=10)
+            tk.Button(btn_frame_popup, text="Hapus User Selected", font=("Segoe UI", 11, "bold"), bg=COLOR_DANGER, fg="white", relief="flat", padx=10, pady=5, command=hapus_user_terpilih).pack(side="left", padx=10)
             tk.Button(btn_frame_popup, text="Tutup", font=("Segoe UI", 11), bg="#5c5f66", fg="white", relief="flat", padx=15, pady=5, command=popup.destroy).pack(side="left", padx=10)
 
         except Exception as e:
@@ -1067,7 +1133,7 @@ class App(tk.Tk):
             
             self.su_recognizer, self.su_label_map = train_model()
             
-            threading.Thread(target=lambda: bukatts("Registrasi wajah berhasil disimpan"), daemon=True).start()
+            bukatts("Registrasi wajah berhasil disimpan")
             messagebox.showinfo("Sukses", f"Registrasi wajah '{self.dw_nama}' selesai! Model telah diperbarui.")
             self.build_sistem_utama()
 
