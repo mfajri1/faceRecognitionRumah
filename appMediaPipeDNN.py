@@ -7,22 +7,7 @@ SISTEM KEAMANAN PINTU: WAJAH (OPENCV DNN) + SUARA + SUARA SPEAKER & SERVO DOOR
    - Password Suara Benar -> Solenoid + Servo Aktif (Pintu Terbuka 2s) -> Tertutup
    - Password Suara Salah -> Electric Discharge 6s + Kirim Notifikasi WA + Peringatan Suara Speaker
 3. Suara Pengumuman Speaker (gTTS + Pygame)
-4. Servo Motor Terhubung di GPIO 24
-
-PERBAIKAN (revisi):
-- [FIX AUDIO] pygame.mixer di-init SATU KALI dengan pre_init (frequency 24000Hz,
-  buffer lebih besar) supaya tidak noise/crackle saat resample MP3 gTTS.
-  Sebelumnya mixer.init() dipanggil 2x dengan setting default -> penyebab noise.
-- [FIX AUDIO] Tambah threading.Lock() di sekitar pemutaran audio supaya tidak
-  ada race condition antar-thread yang membuat suara mendadak berhenti/mati.
-- [FIX LOGIKA VERIFIKASI] Setelah proses speech_to_text() (yang makan waktu
-  beberapa detik), wajah dideteksi ULANG dari frame kamera TERBARU sebelum
-  di-crop untuk prediksi LBPH. Sebelumnya kode memakai koordinat wajah LAMA
-  (dari sebelum bicara) tapi mengambil pixel dari frame BARU -> hasil crop
-  salah posisi -> prediksi ngaco -> akses ditolak walau suara benar.
-- [FIX LOGIKA VERIFIKASI] Kondisi "or confidence > 70" dihapus. Pada LBPH,
-  confidence LEBIH KECIL = LEBIH MIRIP (bukan sebaliknya), jadi syarat lama
-  itu terbalik dan berpotensi meloloskan wajah yang justru TIDAK cocok.
+4. Servo Motor Terhubung di GPIO 24 (Otomatis posisi 0 Derajat saat booting/pertama hidup)
 """
 
 import os
@@ -37,13 +22,10 @@ import urllib.request
 import cv2
 import numpy as np
 import speech_recognition as sr
-
-import pygame  # Tambahkan import pygame di bagian atas script
+import pygame
 
 # ------------------------------------------------------------------
-# [FIX AUDIO] Inisialisasi Audio Mixer HANYA 1 KALI, dengan pre_init
-# supaya sample rate & buffer cocok dengan file MP3 hasil gTTS (24kHz).
-# Ini mengatasi noise/crackling saat playback.
+# Inisialisasi Audio Mixer HANYA 1 KALI (24kHz, buffer 4096)
 # ------------------------------------------------------------------
 try:
     pygame.mixer.pre_init(frequency=24000, size=-16, channels=2, buffer=4096)
@@ -52,7 +34,6 @@ try:
 except Exception as e:
     print(f"[AUDIO ERROR] Gagal inisialisasi mixer: {e}")
 
-# [FIX AUDIO] Lock supaya pemutaran audio tidak ditabrak dari thread lain
 tts_lock = threading.Lock()
 
 import tkinter as tk
@@ -119,7 +100,6 @@ except Exception as e:
     DNN_AVAILABLE = False
     print(f"[DNN WARNING] Gagal memuat model DNN: {e}")
 
-
 # ============================================================
 # KONFIGURASI SISTEM & PIN HARDWARE
 # ============================================================
@@ -143,16 +123,15 @@ ADMIN_PASSWORD_DEFAULT = "admin123"
 
 SHIFTWA_API_KEY = "sk_live_50a3b10f8561a3615fd8e4db49094369b80855066da5a92066ad1102a15ac20c"
 SHIFTWA_BASE_URL = "https://api.shiftwa.dev/v1"
-
 WA_TARGET = "+628136554516"
 
 # PIN GPIO HARDWARE
 RELAY_SOLENOID_PIN = 27       # Relay 1 (Solenoid Pintu)
 RELAY_DISCHARGE_PIN = 23      # Relay 2 (Electric Discharge)
 BUZZER_PIN = 22               # Buzzer Peringatan
-SERVO_PIN = 24                # Servo Pintu (MENGGANTIKAN LED)
+SERVO_PIN = 24                # Servo Pintu
 
-DURASI_SOLENOID_DETIK = 2      # Pintu terbuka selama 2 detik
+DURASI_SOLENOID_DETIK = 2     # Pintu terbuka selama 2 detik
 DURASI_DISCHARGE_DETIK = 6     
 
 RELAY_ACTIVE_LOW = True
@@ -162,20 +141,18 @@ BUZZER_ACTIVE_LOW = False
 # HELPER SUARA SPEAKER (TTS OFFLINE / AUDIO LOKAL)
 # ============================================================
 
-# 2. Kamus Pemetaan Audio
 AUDIO_MAP = {
     "Selamat datang pada sistem keamanan pintar": "welcome",
     "Silakan dekatkan wajah Anda ke kamera": "posisi_wajah",
     "Wajah Anda terdaftar, silakan masuk": "wajah_ok",
+    "Wajah tidak dikenal. Silakan ucapkan kata sandi suara Anda": "minta_password",
     "Kata sandi benar, silakan masuk": "pass_benar",
     "Peringatan! Kata sandi salah. Akses ditolak": "pass_salah",
     "Mode registrasi aktif. Silakan ikuti petunjuk posisi wajah di layar": "mode_reg",
     "Registrasi wajah berhasil disimpan": "reg_sukses"
 }
 
-# 3. Fungsi Pemutar Audio (0 Delay, Anti-Macet, Thread-Safe)
 def bukatts(teks):
-    """Memutar MP3 lokal menggunakan Pygame Mixer (Instan, aman dari race condition antar-thread)"""
     key_file = AUDIO_MAP.get(teks)
     if not key_file:
         print(f"[TTS WARNING] Teks '{teks}' belum terdaftar di AUDIO_MAP!")
@@ -186,8 +163,6 @@ def bukatts(teks):
         print(f"[TTS ERROR] File '{file_path}' tidak ditemukan!")
         return
 
-    # [FIX AUDIO] Kunci akses mixer supaya tidak ditimpa/dihentikan
-    # oleh thread lain yang memanggil bukatts() secara bersamaan.
     with tts_lock:
         try:
             if pygame.mixer.music.get_busy():
@@ -197,10 +172,6 @@ def bukatts(teks):
             pygame.mixer.music.play()
             print(f"[SPEAKER TTS]: '{teks}'")
 
-            # Tunggu sampai selesai bicara sebelum melepas lock,
-            # supaya panggilan berikutnya tidak memotong audio ini
-            # dan supaya mic (jika dibuka segera setelah ini) tidak
-            # bentrok dengan speaker yang masih aktif.
             while pygame.mixer.music.get_busy():
                 time.sleep(0.05)
         except Exception as e:
@@ -276,7 +247,9 @@ def lcd_cetak(baris1="", baris2="", baris3="", baris4=""):
     except Exception as e:
         print(f"[LCD ERROR] Gagal menulis ke layar: {e}")
 
-# INISIALISASI HARDWARE GPIO
+# ------------------------------------------------------------
+# INISIALISASI HARDWARE GPIO & SERVO AWAL (0 DERAJAT)
+# ------------------------------------------------------------
 if GPIO_AVAILABLE:
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
@@ -285,7 +258,10 @@ if GPIO_AVAILABLE:
 
     # Inisialisasi PWM Servo di GPIO 24 (50Hz)
     servo_pwm = GPIO.PWM(SERVO_PIN, 50)
-    servo_pwm.start(0)
+    # [PERBAIKAN] Langsung gerakkan servo ke 0 Derajat (2.5% Duty Cycle) saat sistem dinyalakan
+    servo_pwm.start(2.5)
+    time.sleep(0.5)               # Jeda agar servo bergerak sempurna ke 0 Derajat
+    servo_pwm.ChangeDutyCycle(0)  # Matikan pulsa agar servo tidak bergetar
 else:
     servo_pwm = None
 
@@ -311,28 +287,53 @@ def bunyi_buzzer_sync(kali):
         time.sleep(0.08)
 
 def gerak_pintu_servo_2detik():
-    """Mengaktifkan Solenoid dan Menggerakkan Servo Buka 2 Detik Lalu Tutup Kembali"""
+    """Mengikuti alur logika Arduino: Solenoid & Servo Buka/Tutup"""
+    
+    # 1. Solenoid AKTIF selama 2 detik
     _relay_set(RELAY_SOLENOID_PIN, True)
-    
+    time.sleep(2)
+
+    # 2. Servo bergerak ke 50 derajat
     if GPIO_AVAILABLE and servo_pwm is not None:
         try:
-            servo_pwm.ChangeDutyCycle(7.5) # Buka Pintu (90 Derajat)
-            time.sleep(0.4)
-            servo_pwm.ChangeDutyCycle(0)   # Off sinyal pulsa agar servo stabil
+            duty_50 = 2.5 + (50 / 180.0) * 10.0  # Kisar ~5.28% (50 Derajat)
+            servo_pwm.ChangeDutyCycle(duty_50)
+            time.sleep(0.4)                      
+            servo_pwm.ChangeDutyCycle(0)        
         except Exception as e:
-            print(f"[SERVO ERROR] Gagal Buka: {e}")
-            
-    time.sleep(DURASI_SOLENOID_DETIK) # Tahan pintu terbuka 2 detik
-    
+            print(f"[SERVO ERROR] Gagal Buka 50 Derajat: {e}")
+
+    # 3. Solenoid NONAKTIF (Tunggu 4 detik lalu matikan solenoid)
+    time.sleep(4)
+    _relay_set(RELAY_SOLENOID_PIN, False)
+
+    # 4. Tunggu 2 detik, lalu Solenoid AKTIF lagi selama 3 detik
+    time.sleep(2)
+    _relay_set(RELAY_SOLENOID_PIN, True)
+    time.sleep(3)
+
+    # 5. Servo bergerak kembali ke 0 derajat, lalu tunggu 4 detik
     if GPIO_AVAILABLE and servo_pwm is not None:
         try:
-            servo_pwm.ChangeDutyCycle(2.5) # Tutup Pintu Kembali (0 Derajat)
+            servo_pwm.ChangeDutyCycle(2.5)       # Kembali ke 0 Derajat
             time.sleep(0.4)
             servo_pwm.ChangeDutyCycle(0)
         except Exception as e:
-            print(f"[SERVO ERROR] Gagal Tutup: {e}")
+            print(f"[SERVO ERROR] Gagal Tutup ke 0 Derajat: {e}")
 
+    time.sleep(4)
+
+    # 6. Solenoid NONAKTIF (Kunci kembali rapat) & Re-confirm Servo 0 deg
     _relay_set(RELAY_SOLENOID_PIN, False)
+    time.sleep(4)
+
+    if GPIO_AVAILABLE and servo_pwm is not None:
+        try:
+            servo_pwm.ChangeDutyCycle(2.5)       # Re-confirm 0 Derajat
+            time.sleep(0.4)
+            servo_pwm.ChangeDutyCycle(0)
+        except Exception:
+            pass
 
 def reset_semua_komponen_standby():
     _relay_set(RELAY_SOLENOID_PIN, False)
@@ -340,8 +341,8 @@ def reset_semua_komponen_standby():
     set_buzzer(False)
     if GPIO_AVAILABLE and servo_pwm is not None:
         try:
-            servo_pwm.ChangeDutyCycle(2.5) # Posisi awal pintu tertutup
-            time.sleep(0.2)
+            servo_pwm.ChangeDutyCycle(2.5) # Pastikan kembali ke 0 Derajat
+            time.sleep(0.4)
             servo_pwm.ChangeDutyCycle(0)
         except Exception: pass
     lcd_cetak("=== DOOR LOCK ===", "SISTEM AKTIF", "Silahkan Berdiri", "Di Depan Kamera")
@@ -355,22 +356,6 @@ def dapatkan_daftar_mic():
     except Exception as e:
         print(f"[MIC ERROR] Gagal mendeteksi mikrofon: {e}")
     return mic_list
-
-def dapatkan_index_mic_otomatis():
-    mics = dapatkan_daftar_mic()
-    # Prioritaskan ID Mic 45 sesuai perangkat HDMI/Audio pengguna
-    for idx, _ in mics:
-        if idx == 45:
-            return 45
-    keywords = ["wireless", "usb audio", "pnp", "microphone", "headset", "audio"]
-    for idx, name in mics:
-        name_lower = name.lower()
-        if "keyboard" in name_lower:
-            continue
-        for kw in keywords:
-            if kw in name_lower:
-                return idx
-    return 45  # Default fallback ID 45
 
 # ============================================================
 # LOGIKA DATABASE DAN PEMROSESAN LBPH
@@ -486,12 +471,11 @@ class App(tk.Tk):
         self.last_frame_bgr = None
         self.cooldown_start_time = None 
         
-        self.selected_mic_id = 45 # Default ID Mic 45
+        self.selected_mic_id = 45 
         
         reset_semua_komponen_standby()
         self.build_sistem_utama()
         
-        # Suara sambutan saat sistem pertama kali dinyalakan
         bukatts("Selamat datang pada sistem keamanan pintar")
 
     def clear_window(self):
@@ -568,8 +552,8 @@ class App(tk.Tk):
                     
                 if res2.status_code not in (200, 201, 204): return
                 
-                #payload = {"to": WA_TARGET, "media": {"storageKey": storage_key, "caption": caption}}
-                #requests.post(f"{SHIFTWA_BASE_URL}/messages/send", headers=headers_auth, json=payload, timeout=10)
+                payload = {"to": WA_TARGET, "media": {"storageKey": storage_key, "caption": caption}}
+                requests.post(f"{SHIFTWA_BASE_URL}/messages/send", headers=headers_auth, json=payload, timeout=10)
                 print("[SHIFTWA] Log Keamanan Berhasil Dikirim ke WA!")
             except Exception as e:
                 print(f"[SHIFTWA ERROR] Gagal kirim media: {e}")
@@ -733,9 +717,7 @@ class App(tk.Tk):
                         wajah_terverifikasi = True
                         nama_user = self.su_label_map.get(label, "User")
 
-            # -----------------------------------------------------------------
-            # TAHAP 1: WAJAH TERDETEKSI -> BUKA PINTU 2s DENGAN SERVO & SOLENOID
-            # -----------------------------------------------------------------
+            # TAHAP 1: WAJAH TERDETEKSI -> BUKA PINTU
             if wajah_terverifikasi:
                 self.su_set_status_threadsafe(f"WAJAH TERDETEKSI: Welcome {nama_user}!\nSELAMAT, SILAHKAN MASUK!")
                 lcd_cetak("=== AKSES DITERIMA ===", f"Halo, {nama_user}", "SILAHKAN MASUK", "PINTU TERBUKA")
@@ -743,15 +725,12 @@ class App(tk.Tk):
                 bunyi_buzzer_sync(2)
                 bukatts("Wajah Anda terdaftar, silakan masuk")
                 
-                # Buka Solenoid + Servo Pintu 2 Detik Lalu Tutup Otomatis
                 gerak_pintu_servo_2detik()
                 return
 
-            # -----------------------------------------------------------------
-            # TAHAP 2: VERIFIKASI SUARA (VERIFIKASI SILANG WAJAH & PASSWORD)
-            # -----------------------------------------------------------------
+            # TAHAP 2: VERIFIKASI SUARA
             bunyi_buzzer_sync(2)
-            #bukatts("Wajah tidak dikenal. Silakan ucapkan kata sandi suara Anda")
+            bukatts("Wajah tidak dikenal. Silakan ucapkan kata sandi suara Anda")
             
             self.su_set_status_threadsafe("Wajah belum terverifikasi!\nMembuka mikrofon, silahkan ucapkan password suara anda...")
             lcd_cetak("VERIFIKASI SUARA", "Gunakan Password", "Silahkan Ucapkan", "Password Suara!")
@@ -773,18 +752,6 @@ class App(tk.Tk):
                         pemilik_password = u_name
                         break
 
-            # -----------------------------------------------------------------
-            # [FIX LOGIKA VERIFIKASI]
-            # speech_to_text() di atas makan waktu beberapa detik. Selama itu,
-            # thread kamera (update_su_camera) terus menimpa self.last_frame_bgr
-            # dengan frame BARU. Kalau kita pakai koordinat wajah `wajah` yang
-            # lama (dideteksi SEBELUM bicara) untuk meng-crop frame yang SUDAH
-            # BARU, hasil crop bisa salah posisi -> prediksi LBPH ngaco ->
-            # akses ditolak meski suara benar.
-            #
-            # Solusinya: ambil frame TERBARU sekarang, lalu deteksi ULANG
-            # posisi wajah dari frame itu juga, baru lakukan crop + predict.
-            # -----------------------------------------------------------------
             frame_verifikasi = self.last_frame_bgr.copy() if self.last_frame_bgr is not None else None
             wajah_verifikasi = dapatkan_wajah_terbesar(frame_verifikasi) if frame_verifikasi is not None else None
 
@@ -800,14 +767,6 @@ class App(tk.Tk):
                     label_prediksi, confidence = self.su_recognizer.predict(face_img)
                     nama_prediksi = self.su_label_map.get(label_prediksi, "")
 
-                    print(f"[DEBUG LOG] Teks Ucapan Suara : '{spoken_text}'")
-                    print(f"[DEBUG LOG] Pemilik Password  : '{pemilik_password}'")
-                    print(f"[DEBUG LOG] Hasil Prediksi Wajah LBPH : '{nama_prediksi}' (Confidence: {confidence:.1f}, threshold: {LBPH_THRESHOLD})")
-
-                    # [FIX] Confidence LBPH: makin KECIL makin mirip.
-                    # Syarat lama "or confidence > 70" terbalik dan dihapus;
-                    # sekarang hanya diterima jika nama prediksi cocok DAN
-                    # confidence di bawah threshold yang sama seperti Tahap 1.
                     if nama_prediksi == pemilik_password and confidence < LBPH_THRESHOLD:
                         password_benar = True
                         nama_user = pemilik_password
@@ -819,7 +778,6 @@ class App(tk.Tk):
                 bunyi_buzzer_sync(2)
                 bukatts("Kata sandi benar, silakan masuk")
                 
-                # Buka Solenoid + Servo Pintu 2 Detik Lalu Tutup Otomatis
                 gerak_pintu_servo_2detik()
 
             else:
