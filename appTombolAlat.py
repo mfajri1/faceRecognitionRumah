@@ -667,6 +667,11 @@ class App(tk.Tk):
                     label, confidence = self.su_recognizer.predict(face_img)
                     cv2.imwrite("pintu_log.jpg", self.last_frame_bgr)
 
+                    nama_prediksi_debug = self.su_label_map.get(label, "?")
+                    print(f"[FACE DEBUG] Prediksi terdekat: '{nama_prediksi_debug}' | "
+                          f"confidence={confidence:.1f} (semakin kecil semakin mirip, "
+                          f"threshold saat ini={LBPH_THRESHOLD})")
+
                     if confidence < LBPH_THRESHOLD:
                         wajah_terverifikasi = True
                         nama_user = self.su_label_map.get(label, "User")
