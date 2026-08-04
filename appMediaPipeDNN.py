@@ -1,13 +1,12 @@
 """
-SISTEM KEAMANAN PINTU: WAJAH (OPENCV DNN) + SUARA + SUARA SPEAKER & SERVO DOOR
+SISTEM KEAMANAN PINTU: WAJAH (OPENCV DNN) + TOMBOL AKSES (GPIO25) & SERVO DOOR
 ===================================================================
-1. Buka Pintu dengan Wajah -> Terdeteksi -> Solenoid + Servo Aktif (Pintu Terbuka 2s) -> Tertutup Kembali
-2. Jika Wajah Tidak Terdeteksi / Asing -> Verifikasi Password Suara (Mic ID 45)
-   - Cross-check Wajah & Password
-   - Password Suara Benar -> Solenoid + Servo Aktif (Pintu Terbuka 2s) -> Tertutup
-   - Password Suara Salah -> Electric Discharge 6s + Kirim Notifikasi WA + Peringatan Suara Speaker
-3. Suara Pengumuman Speaker (gTTS + Pygame)
-4. Servo Motor Terhubung di GPIO 24 (Otomatis posisi 0 Derajat saat booting/pertama hidup)
+1. Buka Pintu dengan Wajah -> Terdeteksi & Cocok -> Solenoid + Servo Aktif (Pintu Terbuka 2s) -> Tertutup Kembali
+2. Jika Wajah Tidak Dikenali -> Akses Ditolak -> Electric Discharge 6s + Kirim Notifikasi WA + Peringatan Suara Speaker
+3. Mode Akses dapat dipilih di GUI: WEBCAM (deteksi wajah otomatis) atau TOMBOL (tombol fisik di GPIO25)
+   - Saat mode TOMBOL aktif, menekan tombol langsung membuka pintu (tanpa perlu verifikasi wajah)
+4. Suara Pengumuman Speaker (Audio Lokal via Pygame)
+5. Servo Motor Terhubung di GPIO 24 (Otomatis posisi 0 Derajat saat booting/pertama hidup)
 """
 
 import os
@@ -15,22 +14,23 @@ import json
 import hashlib
 import threading
 import time
-import random
 import shutil
 import urllib.request
 
 import cv2
 import numpy as np
-import speech_recognition as sr
 import pygame
 
 # ------------------------------------------------------------------
-# Inisialisasi Audio Mixer HANYA 1 KALI (24kHz, buffer 4096)
+# Inisialisasi Audio Mixer & Paksa Output ke Jack Audio 3.5mm (Card 1)
 # ------------------------------------------------------------------
+os.environ["SDL_AUDIODRIVER"] = "alsa"
+os.environ["AUDIODEV"] = "plughw:1,0"  # Card 1 = Headphones (Jack 3.5mm Raspi)
+
 try:
     pygame.mixer.pre_init(frequency=24000, size=-16, channels=2, buffer=4096)
     pygame.mixer.init()
-    print("[AUDIO] Pygame Mixer berhasil diinisialisasi (24kHz, buffer 4096).")
+    print("[AUDIO] Pygame Mixer dikunci ke Jack 3.5mm (plughw:1,0) Sukses.")
 except Exception as e:
     print(f"[AUDIO ERROR] Gagal inisialisasi mixer: {e}")
 
@@ -48,13 +48,6 @@ try:
     import requests
 except ImportError:
     requests = None  
-
-try:
-    from gtts import gTTS
-    TTS_AVAILABLE = True
-except ImportError:
-    TTS_AVAILABLE = False
-    print("[TTS WARNING] Library 'gTTS' atau 'pygame' belum terinstall. Jalankan: pip install gTTS pygame")
 
 try:
     import RPi.GPIO as GPIO
@@ -75,7 +68,7 @@ except Exception as e:
     lcd = None
     print(f"[LCD WARNING] Gagal memuat LCD (Mode simulasi): {e}")
 
-# --- INTEGRASI OPENCV DNN FACE DETECTOR ---
+# --- INTEGRASI OPENCV DNN FACE DETECTOR (opsional, cadangan) ---
 PROTO_URL = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
 MODEL_URL = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
 
@@ -108,7 +101,7 @@ DATASET_DIR = "dataset"
 USERS_FILE = "users.json"
 MIN_SAMPLES = 9 
 FACE_SIZE = (200, 200) 
-LBPH_THRESHOLD = 52 
+LBPH_THRESHOLD = 43 
 
 VIDEO_DISPLAY_SIZE = (480, 270) 
 
@@ -123,13 +116,14 @@ ADMIN_PASSWORD_DEFAULT = "admin123"
 
 SHIFTWA_API_KEY = "sk_live_50a3b10f8561a3615fd8e4db49094369b80855066da5a92066ad1102a15ac20c"
 SHIFTWA_BASE_URL = "https://api.shiftwa.dev/v1"
-WA_TARGET = "+628136554516"
+WA_TARGET = "+6281267978173"
 
 # PIN GPIO HARDWARE
 RELAY_SOLENOID_PIN = 27       # Relay 1 (Solenoid Pintu)
 RELAY_DISCHARGE_PIN = 23      # Relay 2 (Electric Discharge)
 BUZZER_PIN = 22               # Buzzer Peringatan
 SERVO_PIN = 24                # Servo Pintu
+BUTTON_PIN = 25               # Tombol Akses Masuk (aktif LOW, tombol ke GND, pull-up internal)
 
 DURASI_SOLENOID_DETIK = 2     # Pintu terbuka selama 2 detik
 DURASI_DISCHARGE_DETIK = 6     
@@ -137,17 +131,36 @@ DURASI_DISCHARGE_DETIK = 6
 RELAY_ACTIVE_LOW = True
 BUZZER_ACTIVE_LOW = False
 
+BUTTON_DEBOUNCE_DETIK = 0.05
+COOLDOWN_DETIK = 7.0
+
+# ------------------------------------------------------------
+# KALIBRASI ARAH SERVO
+# ------------------------------------------------------------
+# Jika arah buka/tutup servo di alat kamu KEBALIK dari yang diharapkan
+# (misal: harusnya buka malah nutup, atau sebaliknya), tinggal ubah
+# SERVO_REVERSED jadi True. Tidak perlu hitung ulang angka duty cycle manual.
+SERVO_REVERSED = True
+SUDUT_TUTUP = 0    # derajat saat pintu terkunci/standby
+SUDUT_BUKA = 40    # derajat saat pintu terbuka
+
+def sudut_ke_duty(sudut):
+    """Konversi sudut servo (0-180 derajat) ke duty cycle PWM (2.5% - 12.5%).
+    Jika SERVO_REVERSED=True, arah sudut dibalik (180 - sudut)."""
+    sudut_efektif = (180 - sudut) if SERVO_REVERSED else sudut
+    sudut_efektif = max(0, min(180, sudut_efektif))
+    return 2.5 + (sudut_efektif / 180.0) * 10.0
+
 # ============================================================
-# HELPER SUARA SPEAKER (TTS OFFLINE / AUDIO LOKAL)
+# HELPER SUARA SPEAKER (AUDIO LOKAL)
 # ============================================================
 
 AUDIO_MAP = {
     "Selamat datang pada sistem keamanan pintar": "welcome",
-    "Silakan dekatkan wajah Anda ke kamera": "posisi_wajah",
+    "Selamat Datang, Silakan dekatkan wajah Anda ke kamera": "posisi_wajah",
     "Wajah Anda terdaftar, silakan masuk": "wajah_ok",
-    "Wajah tidak dikenal. Silakan ucapkan kata sandi suara Anda": "minta_password",
-    "Kata sandi benar, silakan masuk": "pass_benar",
-    "Peringatan! Kata sandi salah. Akses ditolak": "pass_salah",
+    "Wajah tidak dikenali. Akses ditolak": "wajah_ditolak",
+    "Akses tombol diterima, silakan masuk": "tombol_ok",
     "Mode registrasi aktif. Silakan ikuti petunjuk posisi wajah di layar": "mode_reg",
     "Registrasi wajah berhasil disimpan": "reg_sukses"
 }
@@ -256,11 +269,14 @@ if GPIO_AVAILABLE:
     for pin in [RELAY_SOLENOID_PIN, RELAY_DISCHARGE_PIN, BUZZER_PIN, SERVO_PIN]:
         GPIO.setup(pin, GPIO.OUT)
 
+    # Tombol akses masuk (GPIO25) - tombol ke GND, pull-up internal, aktif LOW saat ditekan
+    GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
     # Inisialisasi PWM Servo di GPIO 24 (50Hz)
     servo_pwm = GPIO.PWM(SERVO_PIN, 50)
-    # [PERBAIKAN] Langsung gerakkan servo ke 0 Derajat (2.5% Duty Cycle) saat sistem dinyalakan
-    servo_pwm.start(2.5)
-    time.sleep(0.5)               # Jeda agar servo bergerak sempurna ke 0 Derajat
+    # [PERBAIKAN] Langsung gerakkan servo ke posisi TERTUTUP saat sistem dinyalakan
+    servo_pwm.start(sudut_ke_duty(SUDUT_TUTUP))
+    time.sleep(0.5)               # Jeda agar servo bergerak sempurna
     servo_pwm.ChangeDutyCycle(0)  # Matikan pulsa agar servo tidak bergetar
 else:
     servo_pwm = None
@@ -286,50 +302,59 @@ def bunyi_buzzer_sync(kali):
         set_buzzer(False)
         time.sleep(0.08)
 
+def tombol_ditekan():
+    """True jika tombol akses (GPIO25) sedang ditekan (aktif LOW)."""
+    if not GPIO_AVAILABLE:
+        return False
+    return GPIO.input(BUTTON_PIN) == GPIO.LOW
+
 def gerak_pintu_servo_2detik():
-    """Mengikuti alur logika Arduino: Solenoid & Servo Buka/Tutup"""
+    """Mengikuti alur logika Arduino: Solenoid & Servo Buka 40 Derajat / Tutup Lambat ke 0 Derajat"""
     
     # 1. Solenoid AKTIF selama 2 detik
     _relay_set(RELAY_SOLENOID_PIN, True)
     time.sleep(2)
 
-    # 2. Servo bergerak ke 50 derajat
+    # 2. Servo BUKA CEPAT ke posisi terbuka
     if GPIO_AVAILABLE and servo_pwm is not None:
         try:
-            duty_50 = 2.5 + (50 / 180.0) * 10.0  # Kisar ~5.28% (50 Derajat)
-            servo_pwm.ChangeDutyCycle(duty_50)
+            servo_pwm.ChangeDutyCycle(sudut_ke_duty(SUDUT_BUKA))
             time.sleep(0.4)                      
             servo_pwm.ChangeDutyCycle(0)        
         except Exception as e:
-            print(f"[SERVO ERROR] Gagal Buka 50 Derajat: {e}")
+            print(f"[SERVO ERROR] Gagal Buka: {e}")
 
-    # 3. Solenoid NONAKTIF (Tunggu 4 detik lalu matikan solenoid)
+    # 3. Solenoid NONAKTIF (Tunggu 4 detik)
     time.sleep(4)
     _relay_set(RELAY_SOLENOID_PIN, False)
 
-    # 4. Tunggu 2 detik, lalu Solenoid AKTIF lagi selama 3 detik
+    # 4. Solenoid AKTIF lagi selama 3 detik
     time.sleep(2)
-    _relay_set(RELAY_SOLENOID_PIN, True)
-    time.sleep(3)
+    _relay_set(RELAY_SOLENOID_PIN, False)
+    time.sleep(2)
 
-    # 5. Servo bergerak kembali ke 0 derajat, lalu tunggu 4 detik
+    # ----------------------------------------------------
+    # 5. Servo bergerak kembali ke posisi tertutup, lalu tunggu 4 detik
+    # ----------------------------------------------------
     if GPIO_AVAILABLE and servo_pwm is not None:
         try:
-            servo_pwm.ChangeDutyCycle(2.5)       # Kembali ke 0 Derajat
+            servo_pwm.ChangeDutyCycle(sudut_ke_duty(SUDUT_TUTUP))   # Kembali ke posisi tertutup
             time.sleep(0.4)
             servo_pwm.ChangeDutyCycle(0)
         except Exception as e:
-            print(f"[SERVO ERROR] Gagal Tutup ke 0 Derajat: {e}")
+            print(f"[SERVO ERROR] Gagal Tutup: {e}")
 
     time.sleep(4)
 
-    # 6. Solenoid NONAKTIF (Kunci kembali rapat) & Re-confirm Servo 0 deg
+    # ----------------------------------------------------
+    # 6. Solenoid NONAKTIF (Kunci kembali rapat) & Re-confirm posisi tertutup
+    # ----------------------------------------------------
     _relay_set(RELAY_SOLENOID_PIN, False)
     time.sleep(4)
 
     if GPIO_AVAILABLE and servo_pwm is not None:
         try:
-            servo_pwm.ChangeDutyCycle(2.5)       # Re-confirm 0 Derajat
+            servo_pwm.ChangeDutyCycle(sudut_ke_duty(SUDUT_TUTUP))   # Re-confirm posisi tertutup
             time.sleep(0.4)
             servo_pwm.ChangeDutyCycle(0)
         except Exception:
@@ -341,21 +366,11 @@ def reset_semua_komponen_standby():
     set_buzzer(False)
     if GPIO_AVAILABLE and servo_pwm is not None:
         try:
-            servo_pwm.ChangeDutyCycle(2.5) # Pastikan kembali ke 0 Derajat
+            servo_pwm.ChangeDutyCycle(sudut_ke_duty(SUDUT_TUTUP))  # Pastikan kembali ke posisi tertutup
             time.sleep(0.4)
             servo_pwm.ChangeDutyCycle(0)
         except Exception: pass
     lcd_cetak("=== DOOR LOCK ===", "SISTEM AKTIF", "Silahkan Berdiri", "Di Depan Kamera")
-
-def dapatkan_daftar_mic():
-    mic_list = []
-    try:
-        names = sr.Microphone.list_microphone_names()
-        for i, name in enumerate(names):
-            mic_list.append((i, name))
-    except Exception as e:
-        print(f"[MIC ERROR] Gagal mendeteksi mikrofon: {e}")
-    return mic_list
 
 # ============================================================
 # LOGIKA DATABASE DAN PEMROSESAN LBPH
@@ -405,53 +420,6 @@ def train_model():
     recognizer.train(faces, np.array(labels))
     return recognizer, label_map
 
-def speech_to_text(device_id=45, status_callback=None, wave_callback=None):
-    def update(msg, l1="", l2="", l3="", l4=""):
-        if status_callback: status_callback(msg)
-        lcd_cetak(l1, l2, l3, l4)
-        
-    recognizer_sr = sr.Recognizer()
-    id_mic = device_id if device_id is not None else 45
-    sample_rate = 48000
-    
-    animating = True
-    def animate_spectrum():
-        while animating:
-            if wave_callback:
-                heights = [random.randint(5, 45) for _ in range(16)]
-                wave_callback(heights)
-            time.sleep(0.08)
-
-    t_anim = threading.Thread(target=animate_spectrum, daemon=True)
-    t_anim.start()
-
-    try:
-        with sr.Microphone(device_index=id_mic, sample_rate=sample_rate) as source:
-            update("Menyesuaikan ambang batas kebisingan...", "VERIFIKASI SUARA", "Mohon Tenang...", "Kalibrasi Mic...", "")
-            recognizer_sr.adjust_for_ambient_noise(source, duration=0.8)
-            
-            update("Silahkan ucapkan password anda...", "VERIFIKASI SUARA", "Silahkan Ucapkan", "Password Anda!", "")
-            audio = recognizer_sr.listen(source, timeout=5, phrase_time_limit=5)
-    except Exception as e:
-        print(f"[AUDIO ERROR]: {e}")
-        animating = False
-        if wave_callback: wave_callback([0]*16)
-        return None
-    
-    animating = False
-    if wave_callback: wave_callback([0]*16)
-
-    update("Mengirim audio ke Cloud Google STT...", "VERIFIKASI SUARA", "Memproses Audio...", "Harap Tunggu...", "")
-    try:
-        res = recognizer_sr.recognize_google(audio, language="id-ID")
-        return res
-    except sr.UnknownValueError:
-        update("Google STT gagal menerjemahkan.", "VERIFIKASI GAGAL", "Suara Tidak", "Jelas / Terputus", "")
-        return None
-    except sr.RequestError:
-        update("Koneksi internet lambat / Cloud Timeout.", "VERIFIKASI GAGAL", "Koneksi Internet", "Bermasalah!", "")
-        return None
-
 # ============================================================
 # ANTARMUKA GUI UTAMA (TKINTER)
 # ============================================================
@@ -459,7 +427,7 @@ def speech_to_text(device_id=45, status_callback=None, wave_callback=None):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Sistem Keamanan Pintu: Wajah + Suara")
+        self.title("Sistem Keamanan Pintu: Wajah + Tombol Akses")
         self.geometry("800x720")
         self.resizable(False, False)
         self.configure(bg=COLOR_BG)
@@ -470,12 +438,14 @@ class App(tk.Tk):
         self.camera_after_id = None
         self.last_frame_bgr = None
         self.cooldown_start_time = None 
-        
-        self.selected_mic_id = 45 
-        
+
         reset_semua_komponen_standby()
         self.build_sistem_utama()
-        
+
+        # Thread pemantau tombol akses (GPIO25), berjalan terus selama aplikasi hidup
+        self.button_monitor_running = True
+        threading.Thread(target=self.monitor_button, daemon=True).start()
+
         bukatts("Selamat datang pada sistem keamanan pintar")
 
     def clear_window(self):
@@ -504,6 +474,7 @@ class App(tk.Tk):
         label_widget.configure(image=imgtk)
 
     def on_close(self):
+        self.button_monitor_running = False
         self.release_camera()
         reset_semua_komponen_standby()
         if LCD_AVAILABLE and lcd is not None:
@@ -561,6 +532,48 @@ class App(tk.Tk):
         threading.Thread(target=target, daemon=True).start()
 
     # ============================================================
+    # PEMANTAU TOMBOL AKSES (GPIO25)
+    # ============================================================
+    def monitor_button(self):
+        """Berjalan di background sepanjang waktu, berdampingan dengan deteksi wajah.
+        Tombol ditekan -> pintu langsung dibuka tanpa perlu verifikasi wajah."""
+        while self.button_monitor_running:
+            try:
+                if (tombol_ditekan()
+                        and self.cooldown_start_time is None
+                        and not getattr(self, "su_processing", False)):
+
+                    self.su_processing = True
+                    threading.Thread(target=self.alur_akses_tombol, daemon=True).start()
+
+                    # Tunggu sampai tombol dilepas agar tidak ke-trigger berkali-kali
+                    while tombol_ditekan() and self.button_monitor_running:
+                        time.sleep(0.05)
+
+                time.sleep(BUTTON_DEBOUNCE_DETIK)
+            except Exception as e:
+                print(f"[BUTTON ERROR] {e}")
+                time.sleep(0.5)
+
+    def alur_akses_tombol(self):
+        try:
+            self.su_set_status_threadsafe("Tombol akses ditekan! Membuka pintu...")
+            lcd_cetak("=== BUKA PINTU ===", "Tombol Ditekan", "SILAHKAN MASUK", "PINTU TERBUKA")
+
+            bunyi_buzzer_sync(2)
+            bukatts("Akses tombol diterima, silakan masuk")
+
+            gerak_pintu_servo_2detik()
+
+            # Servo & solenoid sudah kembali menutup -> langsung tampilkan layar awal
+            reset_semua_komponen_standby()
+            self.su_set_status_threadsafe("Berdiri di depan kamera atau tekan tombol akses...")
+        except Exception as e:
+            print(f"[TOMBOL ERROR] {e}")
+        finally:
+            self.cooldown_start_time = time.time()
+
+    # ============================================================
     # 1. HALAMAN UTAMA
     # ============================================================
     def build_sistem_utama(self):
@@ -574,81 +587,38 @@ class App(tk.Tk):
         tk.Button(top_bar, text="Keluar", font=("Segoe UI", 10, "bold"), bg=COLOR_DANGER, fg="white", relief="flat", padx=10, pady=4, command=self.on_close).pack(side="right", padx=15, pady=15)
         tk.Button(top_bar, text="Daftar Wajah", font=("Segoe UI", 10, "bold"), bg=COLOR_ACCENT2, fg="white", relief="flat", padx=10, pady=4, command=self.build_login_admin).pack(side="right", padx=0, pady=15)
 
-        mic_frame = tk.Frame(top_bar, bg=COLOR_BG)
-        mic_frame.pack(side="left", padx=15, pady=10)
-        tk.Label(mic_frame, text="Pilih Mic:", font=("Segoe UI", 9, "bold"), bg=COLOR_BG, fg=COLOR_TEXT).pack(side="left", padx=(0,5))
-        
-        mics = dapatkan_daftar_mic()
-        mic_options = [f"[{m[0]}] {m[1][:25]}" for m in mics] if mics else ["Mic Tidak Ditemukan"]
-        self.selected_mic_var = tk.StringVar(value=mic_options[0] if mic_options else "")
-        
-        for opt in mic_options:
-            if opt.startswith("[45]"):
-                self.selected_mic_var.set(opt)
-                break
-                
-        mic_dropdown = ttk.OptionMenu(mic_frame, self.selected_mic_var, self.selected_mic_var.get(), *mic_options, command=self.on_mic_change)
-        mic_dropdown.pack(side="left")
-
         tk.Label(self, text="SISTEM UTAMA KEAMANAN PINTU", font=("Segoe UI", 15, "bold"), bg=COLOR_BG, fg=COLOR_TEXT).pack(pady=(0, 5))
         
         self.su_video_label = tk.Label(self, bg="black", width=VIDEO_DISPLAY_SIZE[0], height=VIDEO_DISPLAY_SIZE[1])
         self.su_video_label.pack(pady=5)
-
-        self.spectrum_canvas = tk.Canvas(self, width=320, height=50, bg="#11111d", highlightthickness=0)
-        self.spectrum_canvas.pack(pady=5)
-        self.draw_spectrum([0]*16)
 
         self.su_status_var = tk.StringVar(value="Memuat model matematika...")
         tk.Label(self, textvariable=self.su_status_var, font=("Segoe UI", 12), bg=COLOR_BG, fg=COLOR_TEXT, wraplength=720, justify="center").pack(pady=10)
 
         self.su_recognizer, self.su_label_map = train_model()
         if self.su_recognizer is None:
-            self.su_status_var.set("Dataset kosong. Daftarkan wajah Anda terlebih dahulu.")
-            lcd_cetak("=== ERROR ===", "DATASET KOSONG", "Daftarkan Wajah!", "")
+            self.su_status_var.set("Dataset kosong. Anda tetap bisa masuk lewat tombol akses, atau daftarkan wajah dulu.")
+            lcd_cetak("=== DOOR LOCK ===", "Dataset Wajah Kosong", "Gunakan Tombol Akses", "Atau Daftar Wajah")
         else:
-            self.su_status_var.set("Berdiri di depan kamera untuk verifikasi wajah...")
+            self.su_status_var.set("Berdiri di depan kamera atau tekan tombol akses...")
             reset_semua_komponen_standby()
 
         self.start_camera()
         self.update_su_camera()
 
-    def on_mic_change(self, val):
-        try:
-            mic_id = int(val.split("]")[0].replace("[", ""))
-            self.selected_mic_id = mic_id
-            print(f"[MIC SELECT] Microphone diubah ke ID: {mic_id}")
-        except Exception as e:
-            print(f"[MIC ERROR] Gagal mengubah ID mic: {e}")
-
-    def draw_spectrum(self, heights):
-        if not hasattr(self, 'spectrum_canvas') or not self.spectrum_canvas.winfo_exists():
-            return
-        self.spectrum_canvas.delete("all")
-        width = 320
-        num_bars = len(heights)
-        bar_width = (width - (num_bars * 4)) / num_bars
-        
-        for i, h in enumerate(heights):
-            x0 = i * (bar_width + 4) + 10
-            y0 = 50 - h
-            x1 = x0 + bar_width
-            y1 = 50
-            self.spectrum_canvas.create_rectangle(x0, y0, x1, y1, fill="#12b886", outline="")
-
-    def update_spectrum_threadsafe(self, heights):
-        self.after(0, lambda: self.draw_spectrum(heights))
-
     def update_su_camera(self):
         if self.cam is None: return
         
         if self.cooldown_start_time is not None:
-            sisa_jeda = 7.0 - (time.time() - self.cooldown_start_time)
+            # Catatan: LCD TIDAK ditulis ulang di sini agar tampilan "kembali ke awal" yang
+            # sudah ditampilkan tepat setelah pintu menutup (di alur_akses_tombol /
+            # alur_keamanan_sekuensial) tidak tertimpa. Jeda ini murni pengaman software
+            # supaya tidak ke-trigger berkali-kali beruntun.
+            sisa_jeda = COOLDOWN_DETIK - (time.time() - self.cooldown_start_time)
             if sisa_jeda > 0:
                 msg = f"Sistem Terkunci Keamanan! Mohon tunggu ({sisa_jeda:.1f}s)..."
                 self.su_status_var.set(msg)
-                lcd_cetak("=== JEDA AMAN ===", "SISTEM LOCK SPAM", f"Sisa: {int(sisa_jeda)} Detik", "Harap Menjauh")
-                
+
                 ret, frame = self.cam.read()
                 if ret:
                     cv2.putText(frame, f"SISTEM LOCK ({sisa_jeda:.1f}s)", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
@@ -658,20 +628,20 @@ class App(tk.Tk):
             else:
                 self.cooldown_start_time = None
                 self.su_processing = False
-                reset_semua_komponen_standby()
+                self.su_status_var.set("Berdiri di depan kamera atau tekan tombol akses...")
 
         ret, frame = self.cam.read()
         if ret:
             self.last_frame_bgr = frame.copy()
             display = frame.copy()
-            
+
             wajah = dapatkan_wajah_terbesar(frame)
-            
+
             if wajah is not None:
                 (x, y, w, h) = wajah
                 cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 cv2.putText(display, "Wajah Terdeteksi", (x, max(y - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
+
                 if not self.su_processing:
                     self.su_processing = True
                     threading.Thread(target=self.alur_keamanan_sekuensial, daemon=True).start()
@@ -684,7 +654,7 @@ class App(tk.Tk):
     def alur_keamanan_sekuensial(self):
         try:
             bunyi_buzzer_sync(1)
-            bukatts("Silakan dekatkan wajah Anda ke kamera")
+            bukatts("Selamat Datang, Silakan dekatkan wajah Anda ke kamera")
             
             for i in range(3, 0, -1):
                 self.su_set_status_threadsafe(f"Wajah terdeteksi! Memindai dalam {i} detik...")
@@ -713,11 +683,16 @@ class App(tk.Tk):
                     label, confidence = self.su_recognizer.predict(face_img)
                     cv2.imwrite("pintu_log.jpg", self.last_frame_bgr)
 
+                    nama_prediksi_debug = self.su_label_map.get(label, "?")
+                    print(f"[FACE DEBUG] Prediksi terdekat: '{nama_prediksi_debug}' | "
+                          f"confidence={confidence:.1f} (semakin kecil semakin mirip, "
+                          f"threshold saat ini={LBPH_THRESHOLD})")
+
                     if confidence < LBPH_THRESHOLD:
                         wajah_terverifikasi = True
                         nama_user = self.su_label_map.get(label, "User")
 
-            # TAHAP 1: WAJAH TERDETEKSI -> BUKA PINTU
+            # WAJAH TERDETEKSI & COCOK -> BUKA PINTU
             if wajah_terverifikasi:
                 self.su_set_status_threadsafe(f"WAJAH TERDETEKSI: Welcome {nama_user}!\nSELAMAT, SILAHKAN MASUK!")
                 lcd_cetak("=== AKSES DITERIMA ===", f"Halo, {nama_user}", "SILAHKAN MASUK", "PINTU TERBUKA")
@@ -726,80 +701,31 @@ class App(tk.Tk):
                 bukatts("Wajah Anda terdaftar, silakan masuk")
                 
                 gerak_pintu_servo_2detik()
+
+                # Servo & solenoid sudah kembali menutup -> langsung tampilkan layar awal
+                reset_semua_komponen_standby()
+                self.su_set_status_threadsafe("Berdiri di depan kamera atau tekan tombol akses...")
                 return
 
-            # TAHAP 2: VERIFIKASI SUARA
-            bunyi_buzzer_sync(2)
-            bukatts("Wajah tidak dikenal. Silakan ucapkan kata sandi suara Anda")
-            
-            self.su_set_status_threadsafe("Wajah belum terverifikasi!\nMembuka mikrofon, silahkan ucapkan password suara anda...")
-            lcd_cetak("VERIFIKASI SUARA", "Gunakan Password", "Silahkan Ucapkan", "Password Suara!")
-            
-            spoken_text = speech_to_text(
-                device_id=self.selected_mic_id,
-                status_callback=self.su_set_status_threadsafe,
-                wave_callback=self.update_spectrum_threadsafe
-            )
-            
-            password_benar = False
-            pemilik_password = None
-            users = load_users()
+            # WAJAH TIDAK DIKENALI -> AKSES DITOLAK
+            bunyi_buzzer_sync(3)
+            status_msg = "WAJAH TIDAK DIKENALI, AKSES DITOLAK"
 
-            if spoken_text is not None:
-                input_hash = hash_password(spoken_text)
-                for u_name, u_data in users.items():
-                    if u_data.get("password") == input_hash:
-                        pemilik_password = u_name
-                        break
+            self.su_set_status_threadsafe(f"{status_msg}\nELECTRIC DISCHARGE AKTIF (6s)!")
+            lcd_cetak("=== AKSES DITOLAK ===", "WAJAH TAK DIKENAL", "DISCHARGE AKTIF!", "KIRIM NOTIF WA...")
 
-            frame_verifikasi = self.last_frame_bgr.copy() if self.last_frame_bgr is not None else None
-            wajah_verifikasi = dapatkan_wajah_terbesar(frame_verifikasi) if frame_verifikasi is not None else None
+            bukatts("Wajah tidak dikenali. Akses ditolak")
 
-            if pemilik_password is not None and wajah_verifikasi is not None:
-                (x, y, w, h) = wajah_verifikasi
-                gray_frame = cv2.cvtColor(frame_verifikasi, cv2.COLOR_BGR2GRAY)
-                face_crop = gray_frame[y:y + h, x:x + w]
-                
-                if face_crop.size > 0:
-                    face_img = cv2.resize(face_crop, FACE_SIZE)
-                    face_img = normalisasi_cahaya(face_img)
-                    
-                    label_prediksi, confidence = self.su_recognizer.predict(face_img)
-                    nama_prediksi = self.su_label_map.get(label_prediksi, "")
+            cv2.imwrite("pintu_log.jpg", self.last_frame_bgr)
+            self.kirim_shiftwa_async("Orang Asing", status_msg)
 
-                    if nama_prediksi == pemilik_password and confidence < LBPH_THRESHOLD:
-                        password_benar = True
-                        nama_user = pemilik_password
+            _relay_set(RELAY_DISCHARGE_PIN, True)
+            time.sleep(DURASI_DISCHARGE_DETIK)
+            _relay_set(RELAY_DISCHARGE_PIN, False)
 
-            if password_benar:
-                self.su_set_status_threadsafe(f'Suara: "{spoken_text}"\nPASSWORD & WAJAH COCOK ({nama_user})! SILAHKAN MASUK!')
-                lcd_cetak("=== AKSES DITERIMA ===", f"User: {nama_user}", "PASSWORD & WAJAH OK", "PINTU TERBUKA")
-                
-                bunyi_buzzer_sync(2)
-                bukatts("Kata sandi benar, silakan masuk")
-                
-                gerak_pintu_servo_2detik()
-
-            else:
-                bunyi_buzzer_sync(3)
-                teks_log = spoken_text if spoken_text else "Suara Tidak Terdeteksi / Kosong"
-                
-                if pemilik_password and not password_benar:
-                    status_msg = f"PASSWORD BENAR TAPI WAJAH TIDAK COCOK ('{pemilik_password}') Ditolak!"
-                else:
-                    status_msg = f"PASSWORD SALAH: '{teks_log}'"
-
-                self.su_set_status_threadsafe(f"{status_msg}\nELECTRIC DISCHARGE AKTIF (6s)!")
-                lcd_cetak("=== AKSES DITOLAK ===", "AKSES ILEGAL!", "DISCHARGE AKTIF!", "KIRIM NOTIF WA...")
-                
-                bukatts("Peringatan! Kata sandi salah. Akses ditolak")
-                
-                cv2.imwrite("pintu_log.jpg", self.last_frame_bgr)
-                self.kirim_shiftwa_async("Orang Asing", status_msg)
-                
-                _relay_set(RELAY_DISCHARGE_PIN, True)
-                time.sleep(DURASI_DISCHARGE_DETIK)
-                _relay_set(RELAY_DISCHARGE_PIN, False)
+            # Selesai proses penolakan -> kembali ke layar awal
+            reset_semua_komponen_standby()
+            self.su_set_status_threadsafe("Berdiri di depan kamera atau tekan tombol akses...")
 
         except Exception as e:
             print(f"[ALUR ERROR] Terjadi kesalahan dalam proses: {e}")
@@ -882,7 +808,7 @@ class App(tk.Tk):
         self.dw_entry_nama = tk.Entry(form_frame, font=("Segoe UI", 12), width=22)
         self.dw_entry_nama.grid(row=0, column=1, padx=5, pady=5)
 
-        tk.Label(form_frame, text="Password Suara:", font=("Segoe UI", 12), bg=COLOR_BG, fg=COLOR_TEXT).grid(row=1, column=0, sticky="e", padx=5, pady=5)
+        tk.Label(form_frame, text="Password (opsional):", font=("Segoe UI", 12), bg=COLOR_BG, fg=COLOR_TEXT).grid(row=1, column=0, sticky="e", padx=5, pady=5)
         self.dw_entry_password = tk.Entry(form_frame, font=("Segoe UI", 12), width=22, show="*")
         self.dw_entry_password.grid(row=1, column=1, padx=5, pady=5)
 
@@ -1022,17 +948,18 @@ class App(tk.Tk):
         nama = self.dw_entry_nama.get().strip()
         password = self.dw_entry_password.get().strip()
 
-        if nama == "" or password == "":
-            self.dw_status_var.set("Form registrasi nama & password wajib diisi!")
+        if nama == "":
+            self.dw_status_var.set("Nama wajib diisi!")
             return
 
         pastikan_folder_dataset()
         user_dir = os.path.join(DATASET_DIR, nama)
         os.makedirs(user_dir, exist_ok=True)
 
-        users = load_users()
-        users[nama] = {"password": hash_password(password)}
-        save_users(users)
+        if password:
+            users = load_users()
+            users[nama] = {"password": hash_password(password)}
+            save_users(users)
 
         file_lama = [f for f in os.listdir(user_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))]
         self.dw_nama = nama
